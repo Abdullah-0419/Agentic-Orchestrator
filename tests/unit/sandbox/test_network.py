@@ -1,0 +1,104 @@
+"""Unit tests for network allowlist rule generation."""
+
+import pytest
+
+from amelia.sandbox.network import generate_allowlist_rules
+
+
+class TestGenerateAllowlistRules:
+    """Tests for generate_allowlist_rules()."""
+
+    def test_default_rules_structure(self) -> None:
+        """Should generate rules with established, loopback, DNS, proxy, and DROP."""
+        rules = generate_allowlist_rules(allowed_hosts=[])
+
+        assert "ESTABLISHED,RELATED" in rules
+        assert "-i lo -j ACCEPT" in rules
+        assert "--dport 53" in rules
+        assert "host.docker.internal" in rules
+        assert "-j DROP" in rules
+
+    def test_custom_hosts_included(self) -> None:
+        """Custom hosts should appear in the generated rules."""
+        rules = generate_allowlist_rules(
+            allowed_hosts=["api.example.com", "cdn.example.com"],
+        )
+
+        assert "getent hosts api.example.com" in rules
+        assert "getent hosts cdn.example.com" in rules
+
+    def test_proxy_always_allowed(self) -> None:
+        """Proxy host should always be in rules regardless of allowed_hosts."""
+        rules = generate_allowlist_rules(allowed_hosts=[])
+
+        assert "host.docker.internal" in rules
+
+    def test_custom_proxy_host(self) -> None:
+        """Should use custom proxy host when specified."""
+        rules = generate_allowlist_rules(
+            allowed_hosts=[], proxy_host="custom-proxy.local",
+        )
+
+        assert "custom-proxy.local" in rules
+        assert "host.docker.internal" not in rules
+
+    def test_empty_host_list_still_allows_infra(self) -> None:
+        """With no custom hosts, should still allow DNS + loopback + proxy."""
+        rules = generate_allowlist_rules(allowed_hosts=[])
+
+        lines = rules.strip().split("\n")
+        # Must have at least: flush + established + loopback + DNS(2) + proxy + DROP
+        assert len(lines) >= 6
+
+    def test_drop_is_last_rule(self) -> None:
+        """DROP should be the final iptables rule."""
+        rules = generate_allowlist_rules(allowed_hosts=["example.com"])
+
+        iptables_lines = [
+            line for line in rules.strip().split("\n")
+            if line.startswith("iptables")
+        ]
+        assert iptables_lines[-1].endswith("-j DROP")
+
+    def test_output_is_valid_shell(self) -> None:
+        """Output should start with shebang and set -e."""
+        rules = generate_allowlist_rules(allowed_hosts=[])
+
+        assert rules.startswith("#!/bin/sh\nset -e\n")
+
+    def test_dns_restricted_to_docker_resolver(self) -> None:
+        """DNS rules must only allow Docker's internal resolver, not any destination."""
+        rules = generate_allowlist_rules(allowed_hosts=[])
+
+        # Must target Docker's internal DNS
+        assert "-d 127.0.0.11" in rules
+        # Must NOT have open DNS rules (no -d restriction)
+        for line in rules.strip().split("\n"):
+            if "--dport 53" in line and "iptables" in line:
+                assert "-d " in line, f"DNS rule missing destination restriction: {line}"
+
+    def test_custom_dns_server(self) -> None:
+        """Should use custom DNS server when specified."""
+        rules = generate_allowlist_rules(allowed_hosts=[], dns_server="8.8.8.8")
+        assert "-d 8.8.8.8" in rules
+        assert "127.0.0.11" not in rules
+
+    @pytest.mark.parametrize(
+        "dns_server,match",
+        [
+            pytest.param("not-an-ip", "dns_server must be a valid IPv4 address", id="not-an-ip"),
+            pytest.param("8.8.8.8; rm -rf /", "dns_server must be a valid IPv4 address", id="injection"),
+            pytest.param("", "dns_server must be a valid IPv4 address", id="empty"),
+            pytest.param("::1", "must be IPv4", id="ipv6-loopback"),
+            pytest.param("2001:4860:4860::8888", "must be IPv4", id="ipv6-full"),
+        ],
+    )
+    def test_invalid_dns_server_raises(self, dns_server: str, match: str) -> None:
+        """Invalid DNS server values raise ValueError."""
+        with pytest.raises(ValueError, match=match):
+            generate_allowlist_rules(allowed_hosts=[], dns_server=dns_server)
+
+    def test_ipv6_output_blocked(self) -> None:
+        """Should block all IPv6 outbound traffic."""
+        rules = generate_allowlist_rules(allowed_hosts=[])
+        assert "ip6tables -P OUTPUT DROP" in rules

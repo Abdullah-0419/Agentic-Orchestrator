@@ -1,0 +1,534 @@
+"""Integration tests for CLI commands in agentic execution mode.
+
+Tests the Amelia CLI commands: plan, start, approve, reject, status, cancel.
+
+For CLI tests, the proper mock boundaries are:
+- AmeliaClient: HTTP client to Amelia API server (for start/approve/reject/status/cancel)
+- _get_profile_from_server: Server API call for profile (for plan command)
+- create_tracker: External issue tracker API (Jira, GitHub)
+- get_driver / execute_agentic: LLM HTTP boundary (for plan command)
+- get_worktree_context: Git context detection (needed for test isolation)
+
+Internal components like Architect should NOT be mocked.
+"""
+from collections.abc import Generator
+from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+from typer.testing import CliRunner
+
+from amelia.client.models import (
+    CreateWorkflowResponse,
+    WorkflowListResponse,
+    WorkflowSummary,
+)
+from amelia.core.types import AgentConfig, Issue, Profile
+from amelia.drivers.base import AgenticMessage, AgenticMessageType
+from amelia.main import app
+from tests.conftest import create_mock_execute_agentic
+
+
+runner = CliRunner()
+
+
+def _make_workflow_list(issue_id: str, status: str, worktree_path: str | None = None, **overrides) -> WorkflowListResponse:
+    fields = {
+        "id": str(uuid4()),
+        "issue_id": issue_id,
+        "status": status,
+        "worktree_path": worktree_path or "/tmp/test-worktree",
+        "started_at": datetime.now(UTC),
+        **overrides,
+    }
+    return WorkflowListResponse(workflows=[WorkflowSummary(**fields)], total=1)
+
+
+@pytest.fixture(autouse=True)
+def mock_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set API key env var to allow driver construction."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-for-integration-tests")
+
+
+@pytest.fixture
+def mock_worktree_context(tmp_path: Path) -> Generator[MagicMock, None, None]:
+    """Mock git worktree context."""
+    with patch("amelia.client.cli.get_worktree_context") as mock:
+        mock.return_value = (str(tmp_path), "test-worktree")
+        yield mock
+
+
+@pytest.fixture
+def mock_profile(tmp_path: Path) -> Profile:
+    """Create mock profile for CLI tests."""
+    return Profile(
+        name="test",
+        tracker="noop",
+        repo_root=str(tmp_path),
+        plan_output_dir=str(tmp_path / "plans"),
+        agents={
+            "architect": AgentConfig(driver="api", model="openrouter:anthropic/claude-sonnet-4"),
+            "developer": AgentConfig(driver="api", model="openrouter:anthropic/claude-sonnet-4"),
+            "reviewer": AgentConfig(driver="api", model="openrouter:anthropic/claude-sonnet-4"),
+            "plan_validator": AgentConfig(driver="api", model="openrouter:anthropic/claude-sonnet-4"),
+        },
+    )
+
+
+@pytest.mark.integration
+class TestPlanCommand:
+    """Test the `amelia plan` command with real components.
+
+    Real components: Architect (plan logic, state management)
+    Mock boundaries:
+    - get_worktree_context (git detection)
+    - _get_profile_from_server (server API call for profile)
+    - create_tracker (external issue tracker API)
+    - get_driver / execute_agentic (LLM HTTP boundary)
+    """
+
+    def test_plan_command_generates_markdown(
+        self, tmp_path: Path, mock_worktree_context: MagicMock, mock_profile: Profile
+    ) -> None:
+        """amelia plan should generate markdown plan file."""
+        # Create plans directory
+        plans_dir = tmp_path / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+
+        mock_issue = Issue(
+            id="TEST-123",
+            title="Test Issue",
+            description="Test description",
+            status="open",
+        )
+
+        # Resolve the plan path that Architect will use
+        from amelia.core.constants import resolve_plan_path  # noqa: PLC0415
+
+        plan_path = resolve_plan_path(mock_profile.plan_path_pattern, "TEST-123")
+        # Create the plan file on disk (simulates write_file tool execution)
+        full_plan_path = tmp_path / plan_path
+        full_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        full_plan_path.write_text("# Implementation Plan\n\n1. Step one\n2. Step two")
+
+        # Mock driver's execute_agentic to yield messages simulating LLM execution
+        mock_messages = [
+            AgenticMessage(
+                type=AgenticMessageType.TOOL_CALL,
+                tool_name="write_file",
+                tool_input={"file_path": plan_path, "content": "# Plan"},
+                tool_call_id="call-0",
+            ),
+            AgenticMessage(
+                type=AgenticMessageType.TOOL_RESULT,
+                tool_name="write_file",
+                tool_output="File written",
+                tool_call_id="call-0",
+            ),
+            AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content="Plan generated successfully.",
+            ),
+        ]
+
+        mock_driver = MagicMock()
+        mock_driver.execute_agentic = create_mock_execute_agentic(mock_messages)
+
+        with patch("amelia.client.cli._get_profile_from_server", new_callable=AsyncMock) as mock_get_profile, \
+             patch("amelia.client.cli.create_tracker") as mock_create_tracker, \
+             patch("amelia.agents._driver_init.get_driver", return_value=mock_driver):
+
+            mock_get_profile.return_value = mock_profile
+            mock_create_tracker.return_value.get_issue.return_value = mock_issue
+
+            # Run through typer
+            result = runner.invoke(app, ["plan", "TEST-123"])
+
+        assert result.exit_code == 0, f"CLI failed with: {result.stdout}"
+        assert "Plan generated successfully" in result.stdout or "✓" in result.stdout
+
+    def test_plan_command_with_profile(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia plan --profile work should use specified profile."""
+        plans_dir = tmp_path / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+
+        # _get_profile_from_server returns the profile for the requested name directly
+        work_profile = Profile(
+            name="work",
+            tracker="jira",
+            repo_root=str(tmp_path),
+            plan_output_dir=str(plans_dir),
+            agents={
+                "architect": AgentConfig(driver="api", model="openrouter:anthropic/claude-sonnet-4"),
+                "developer": AgentConfig(driver="api", model="openrouter:anthropic/claude-sonnet-4"),
+                "reviewer": AgentConfig(driver="api", model="openrouter:anthropic/claude-sonnet-4"),
+                "plan_validator": AgentConfig(driver="api", model="openrouter:anthropic/claude-sonnet-4"),
+            },
+        )
+
+        mock_issue = Issue(
+            id="WORK-456",
+            title="Work Issue",
+            description="Work description",
+            status="open",
+        )
+
+        # Resolve the plan path that Architect will use
+        from amelia.core.constants import resolve_plan_path  # noqa: PLC0415
+
+        plan_path = resolve_plan_path(work_profile.plan_path_pattern, "WORK-456")
+        # Create the plan file on disk (simulates write_file tool execution)
+        full_plan_path = tmp_path / plan_path
+        full_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        full_plan_path.write_text("# Work Plan\n\n1. Do work")
+
+        # Mock driver's execute_agentic to yield messages simulating LLM execution
+        mock_messages = [
+            AgenticMessage(
+                type=AgenticMessageType.TOOL_CALL,
+                tool_name="write_file",
+                tool_input={"file_path": plan_path, "content": "# Work Plan"},
+                tool_call_id="call-0",
+            ),
+            AgenticMessage(
+                type=AgenticMessageType.TOOL_RESULT,
+                tool_name="write_file",
+                tool_output="File written",
+                tool_call_id="call-0",
+            ),
+            AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content="Plan generated successfully.",
+            ),
+        ]
+
+        mock_driver = MagicMock()
+        mock_driver.execute_agentic = create_mock_execute_agentic(mock_messages)
+
+        with patch("amelia.client.cli._get_profile_from_server", new_callable=AsyncMock) as mock_get_profile, \
+             patch("amelia.client.cli.create_tracker") as mock_create_tracker, \
+             patch("amelia.agents._driver_init.get_driver", return_value=mock_driver):
+
+            mock_get_profile.return_value = work_profile
+            mock_create_tracker.return_value.get_issue.return_value = mock_issue
+
+            result = runner.invoke(app, ["plan", "WORK-456", "--profile", "work"])
+
+        assert result.exit_code == 0, f"CLI failed with: {result.stdout}"
+        # Verify tracker was created (would have been called with work profile's tracker=jira)
+        mock_create_tracker.assert_called_once()
+
+
+@pytest.mark.integration
+class TestStartCommand:
+    """Test the `amelia start` command.
+
+    Mock boundary: AmeliaClient (HTTP client to Amelia API server)
+    """
+
+    def test_start_command_creates_workflow(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia start should create workflow via API."""
+        mock_response = CreateWorkflowResponse(
+            id=str(uuid4()),
+            status="running",
+            message="Workflow created successfully",
+        )
+
+        with patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client.create_workflow = AsyncMock(return_value=mock_response)
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["start", "TEST-456"])
+
+        assert result.exit_code == 0
+        assert "Workflow started" in result.stdout or "wf-123" in result.stdout
+
+    def test_start_command_handles_server_unreachable(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia start should handle server unreachable error gracefully."""
+        from amelia.client.api import ServerUnreachableError
+
+        with patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client.create_workflow = AsyncMock(
+                side_effect=ServerUnreachableError("Cannot connect to server")
+            )
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["start", "TEST-456"])
+
+        assert result.exit_code == 1
+        assert "Error" in result.stdout
+
+
+@pytest.mark.integration
+class TestApproveCommand:
+    """Test the `amelia approve` command.
+
+    Mock boundary: AmeliaClient (HTTP client to Amelia API server)
+    """
+
+    def test_approve_command_approves_workflow(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia approve should approve the pending workflow."""
+        mock_workflows = _make_workflow_list("TEST-789", "awaiting_approval")
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client.approve_workflow = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["approve"])
+
+        assert result.exit_code == 0
+        assert "approved" in result.stdout.lower() or "wf-789" in result.stdout
+
+    def test_approve_command_no_active_workflow(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia approve should error when no workflow is active."""
+        mock_workflows = WorkflowListResponse(workflows=[], total=0)
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["approve"])
+
+        assert result.exit_code == 1
+        assert "No workflow active" in result.stdout
+
+
+@pytest.mark.integration
+class TestRejectCommand:
+    """Test the `amelia reject` command.
+
+    Mock boundary: AmeliaClient (HTTP client to Amelia API server)
+    """
+
+    def test_reject_command_rejects_workflow(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia reject should reject with feedback."""
+        mock_workflows = _make_workflow_list("TEST-REJECT", "awaiting_approval")
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client.reject_workflow = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["reject", "Please add more tests"])
+
+        assert result.exit_code == 0
+        assert "rejected" in result.stdout.lower() or "replan" in result.stdout.lower()
+
+
+@pytest.mark.integration
+class TestStatusCommand:
+    """Test the `amelia status` command.
+
+    Mock boundary: AmeliaClient (HTTP client to Amelia API server)
+    """
+
+    def test_status_command_shows_current_workflow(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia status should show workflow for current worktree."""
+        mock_workflows = _make_workflow_list("TEST-STATUS", "running")
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert "TEST-STATUS" in result.stdout or "TEST-S" in result.stdout
+
+    def test_status_command_all_worktrees(self, tmp_path: Path) -> None:
+        """amelia status --all should show all workflows."""
+        mock_workflows = WorkflowListResponse(
+            workflows=[
+                WorkflowSummary(
+                    id=str(uuid4()),
+                    issue_id="TEST-1",
+                    status="running",
+                    worktree_path="/tmp/worktree-1",
+                    started_at=datetime.now(UTC),
+                ),
+                WorkflowSummary(
+                    id=str(uuid4()),
+                    issue_id="TEST-2",
+                    status="awaiting_approval",
+                    worktree_path="/tmp/worktree-2",
+                    started_at=datetime.now(UTC),
+                ),
+            ],
+            total=2,
+        )
+
+        with patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["status", "--all"])
+
+        assert result.exit_code == 0
+        assert "2" in result.stdout  # Total count
+        # Verify both workflows appear (by issue_id since worktree paths may be truncated)
+        assert "TEST-1" in result.stdout
+        assert "TEST-2" in result.stdout
+
+    def test_status_command_no_workflows(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia status should show message when no workflows active."""
+        mock_workflows = WorkflowListResponse(workflows=[], total=0)
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 0
+        assert "No active workflow" in result.stdout or "no active" in result.stdout.lower()
+
+
+@pytest.mark.integration
+class TestCancelCommand:
+    """Test the `amelia cancel` command.
+
+    Mock boundary: AmeliaClient (HTTP client to Amelia API server)
+    """
+
+    def test_cancel_command_cancels_workflow(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia cancel --force should cancel without confirmation."""
+        mock_workflows = _make_workflow_list("TEST-CANCEL", "running")
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client.cancel_workflow = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["cancel", "--force"])
+
+        assert result.exit_code == 0
+        assert "cancelled" in result.stdout.lower() or "wf-cancel" in result.stdout
+
+    def test_cancel_command_no_workflow(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia cancel should error when no workflow is active."""
+        mock_workflows = WorkflowListResponse(workflows=[], total=0)
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client_class.return_value = mock_client
+
+            result = runner.invoke(app, ["cancel", "--force"])
+
+        assert result.exit_code == 1
+        assert "No workflow active" in result.stdout
+
+    def test_cancel_command_prompts_before_cancelling(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia cancel without --force should prompt and cancel only after user confirms."""
+        workflow_uuid = uuid4()
+        mock_workflows = _make_workflow_list("TEST-CONFIRM", "running", id=str(workflow_uuid))
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client.cancel_workflow = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            # Simulate user typing "y" to confirm
+            result = runner.invoke(app, ["cancel"], input="y\n")
+
+        assert result.exit_code == 0
+        assert "cancelled" in result.stdout.lower() or "wf-confirm" in result.stdout
+        # Verify cancel_workflow was called after confirmation
+        mock_client.cancel_workflow.assert_called_once_with(workflow_id=workflow_uuid)
+
+    def test_cancel_command_aborts_on_decline(
+        self, tmp_path: Path, mock_worktree_context: MagicMock
+    ) -> None:
+        """amelia cancel should NOT cancel when user declines confirmation."""
+        mock_workflows = _make_workflow_list("TEST-DECLINE", "running")
+
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx, \
+             patch("amelia.client.cli.AmeliaClient") as mock_client_class:
+            mock_ctx.return_value = (str(tmp_path), "test-worktree")
+
+            mock_client = MagicMock()
+            mock_client.get_active_workflows = AsyncMock(return_value=mock_workflows)
+            mock_client.cancel_workflow = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            # Simulate user typing "n" to decline
+            result = runner.invoke(app, ["cancel"], input="n\n")
+
+        assert result.exit_code == 0
+        assert "Aborted" in result.stdout
+        # CRITICAL: Verify cancel_workflow was NOT called when user declined
+        mock_client.cancel_workflow.assert_not_called()
+
+
+@pytest.mark.integration
+class TestCLIErrorHandling:
+    """Test CLI error handling."""
+
+    def test_cli_not_in_git_repo(self, tmp_path: Path) -> None:
+        """CLI should error gracefully when not in a git repo."""
+        with patch("amelia.client.cli.get_worktree_context") as mock_ctx:
+            mock_ctx.side_effect = ValueError("Not inside a git repository")
+
+            result = runner.invoke(app, ["status"])
+
+        assert result.exit_code == 1
+        assert "git repository" in result.stdout.lower() or "error" in result.stdout.lower()

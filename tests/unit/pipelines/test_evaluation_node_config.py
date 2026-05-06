@@ -1,0 +1,73 @@
+"""Unit tests for call_evaluation_node using profile.get_agent_config.
+
+This file contains isolated unit tests that mock the Evaluator class.
+For integration tests with real Evaluator (mocking only at driver.generate() boundary),
+see: tests/integration/test_evaluation_node.py
+"""
+
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+
+from amelia.agents.schemas.evaluator import EvaluationResult
+from amelia.core.types import AgentConfig, Issue, Profile
+from amelia.pipelines.implementation.state import ImplementationState
+from amelia.pipelines.review.nodes import call_evaluation_node
+
+
+@pytest.fixture
+def profile_with_agents() -> Profile:
+    return Profile(
+        name="test",
+        tracker="noop",
+        repo_root="/tmp/test",
+        agents={
+            "evaluator": AgentConfig(driver="claude", model="sonnet"),
+        },
+    )
+
+
+@pytest.fixture
+def mock_state() -> ImplementationState:
+    return ImplementationState(
+        workflow_id=uuid4(),
+        profile_id="test",
+        created_at=datetime.now(UTC),
+        status="running",
+        issue=Issue(id="TEST-1", title="Test", description="Test issue"),
+        goal="Implement test feature",
+    )
+
+
+async def test_call_evaluation_node_uses_agent_config(profile_with_agents, mock_state) -> None:
+    """call_evaluation_node should use profile.get_agent_config('evaluator')."""
+    config = {
+        "configurable": {
+            "profile": profile_with_agents,
+            "thread_id": str(uuid4()),
+        }
+    }
+
+    mock_eval_result = EvaluationResult(
+        items_to_implement=[],
+        items_rejected=[],
+        items_deferred=[],
+        summary="No issues found",
+    )
+
+    with patch("amelia.pipelines.review.nodes.Evaluator") as MockEvaluator:
+        mock_evaluator = MagicMock()
+        mock_evaluator.evaluate = AsyncMock(return_value=(mock_eval_result, "session-1"))
+        mock_evaluator.driver = MagicMock()
+        MockEvaluator.return_value = mock_evaluator
+
+        with patch("amelia.pipelines.review.nodes._save_token_usage", new_callable=AsyncMock):
+            await call_evaluation_node(mock_state, config)
+
+        # Verify Evaluator was instantiated with AgentConfig via 'config' kwarg
+        MockEvaluator.assert_called_once()
+        config_arg = MockEvaluator.call_args.kwargs["config"]
+        assert isinstance(config_arg, AgentConfig)
+        assert config_arg.model == "sonnet"

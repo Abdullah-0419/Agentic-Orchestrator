@@ -1,0 +1,130 @@
+"""Tests for amelia.core.constants."""
+
+from datetime import date
+
+from amelia.core.constants import ToolName, normalize_tool_name
+
+
+def test_resolve_plan_path_substitutes_placeholders() -> None:
+    from amelia.core.constants import resolve_plan_path
+
+    pattern = "docs/plans/{date}-{issue_key}.md"
+    result = resolve_plan_path(pattern, "TEST-123")
+    today = date.today().isoformat()
+    assert result == f"docs/plans/{today}-test-123.md"
+
+
+def test_resolve_plan_path_handles_custom_pattern() -> None:
+    from amelia.core.constants import resolve_plan_path
+
+    pattern = ".amelia/plans/{issue_key}.md"
+    result = resolve_plan_path(pattern, "JIRA-456")
+    assert result == ".amelia/plans/jira-456.md"
+
+
+def test_normalize_tool_name_handles_all_driver_variants() -> None:
+    """normalize_tool_name handles tool names from all drivers.
+
+    Both CLI (PascalCase) and API (lowercase) driver tool names
+    are normalized to standard ToolName values.
+    """
+    # Claude CLI driver uses PascalCase
+    assert normalize_tool_name("Write") == ToolName.WRITE_FILE
+    assert normalize_tool_name("Read") == ToolName.READ_FILE
+    assert normalize_tool_name("Bash") == ToolName.RUN_SHELL_COMMAND
+
+    # Unknown names pass through unchanged
+    assert normalize_tool_name("unknown_tool") == "unknown_tool"
+    assert normalize_tool_name("custom") == "custom"
+
+
+def test_tool_name_enum_has_all_canonical_names() -> None:
+    """ToolName enum member count guards against accidental additions/removals.
+
+    Structural invariants (every member has a CLI mapping, aliases are
+    invertible) are verified by other tests. This test catches unintentional
+    enum changes — update the count when adding a new tool deliberately.
+    """
+    assert len(ToolName) == 22
+
+
+def test_tool_name_aliases_covers_all_cli_sdk_names() -> None:
+    """TOOL_NAME_ALIASES maps every CLI SDK name to its canonical name."""
+    from amelia.core.constants import TOOL_NAME_ALIASES
+    expected_cli_names = {
+        "Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep", "Bash",
+        "Task", "TaskOutput", "TaskStop", "EnterPlanMode", "ExitPlanMode",
+        "WritePlan", "AskUserQuestion", "Skill", "TaskCreate", "TaskGet",
+        "TaskUpdate", "TaskList", "WebFetch", "WebSearch", "KnowledgeSearch",
+    }
+    assert set(TOOL_NAME_ALIASES.keys()) == expected_cli_names
+
+
+def test_canonical_to_cli_is_inverse_of_aliases() -> None:
+    """CANONICAL_TO_CLI maps every canonical name back to its CLI SDK name."""
+    from amelia.core.constants import CANONICAL_TO_CLI, TOOL_NAME_ALIASES
+    for cli_name, canonical in TOOL_NAME_ALIASES.items():
+        assert CANONICAL_TO_CLI[canonical] == cli_name
+    assert len(CANONICAL_TO_CLI) == len(TOOL_NAME_ALIASES), "Duplicate canonical names detected in TOOL_NAME_ALIASES"
+
+
+def test_canonical_to_cli_covers_all_tool_names() -> None:
+    """CANONICAL_TO_CLI has an entry for every ToolName enum member."""
+    from amelia.core.constants import CANONICAL_TO_CLI
+    for member in ToolName:
+        assert member.value in CANONICAL_TO_CLI, f"Missing CANONICAL_TO_CLI entry for {member}"
+
+
+def test_readonly_tools_contains_expected_tools() -> None:
+    """READONLY_TOOLS preset includes only safe read/search tools."""
+    from amelia.core.constants import READONLY_TOOLS
+    expected = (
+        ToolName.READ_FILE,
+        ToolName.GLOB,
+        ToolName.GREP,
+        ToolName.WEB_FETCH,
+        ToolName.WEB_SEARCH,
+    )
+    assert expected == READONLY_TOOLS
+
+
+def test_write_plan_in_tool_name_enum() -> None:
+    """write_plan should be a valid ToolName."""
+    assert ToolName.WRITE_PLAN == "write_plan"
+
+
+def test_write_plan_alias_mapping() -> None:
+    """WritePlan CLI name should map to write_plan canonical name."""
+    from amelia.core.constants import TOOL_NAME_ALIASES
+
+    assert TOOL_NAME_ALIASES["WritePlan"] == "write_plan"
+
+
+def test_write_plan_canonical_to_cli() -> None:
+    """write_plan canonical should map back to WritePlan CLI name."""
+    from amelia.core.constants import CANONICAL_TO_CLI
+
+    assert CANONICAL_TO_CLI["write_plan"] == "WritePlan"
+
+
+def test_normalize_write_plan() -> None:
+    """normalize_tool_name should map WritePlan to write_plan."""
+    assert normalize_tool_name("WritePlan") == "write_plan"
+    assert normalize_tool_name("write_plan") == "write_plan"
+
+
+def test_write_plan_normalization_chain() -> None:
+    """Full normalization: WritePlan → write_plan → ToolName.WRITE_PLAN."""
+    normalized = normalize_tool_name("WritePlan")
+    assert normalized == ToolName.WRITE_PLAN
+    assert normalized == "write_plan"
+
+
+def test_readonly_tools_excludes_write_and_exec() -> None:
+    """READONLY_TOOLS must not include any write or execution tools."""
+    from amelia.core.constants import READONLY_TOOLS
+    dangerous = {
+        ToolName.WRITE_FILE, ToolName.EDIT_FILE, ToolName.RUN_SHELL_COMMAND,
+        ToolName.NOTEBOOK_EDIT,
+    }
+    assert not dangerous.intersection(READONLY_TOOLS)

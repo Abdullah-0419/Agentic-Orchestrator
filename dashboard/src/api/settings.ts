@@ -1,0 +1,347 @@
+/**
+ * Settings and Profiles API client.
+ *
+ * Provides functions for managing server settings and profile configurations.
+ */
+
+import { parseErrorDetail } from './errors';
+import { API_BASE_URL, createTimeoutSignal } from './utils';
+
+/**
+ * Handles HTTP response parsing and error handling.
+ */
+async function handleResponse<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    const message = parseErrorDetail(error.detail, `HTTP ${response.status}: ${response.statusText}`);
+    throw new Error(message);
+  }
+  if (response.status === 204 || response.headers?.get('content-length') === '0') {
+    return undefined as T;
+  }
+  return response.json();
+}
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/**
+ * Server-wide settings configuration.
+ */
+export interface ServerSettings {
+  log_retention_days: number;
+  log_retention_max_events: number;
+  checkpoint_retention_days: number;
+  checkpoint_path: string;
+  websocket_idle_timeout_seconds: number;
+  workflow_start_timeout_seconds: number;
+  max_concurrent: number;
+}
+
+/**
+ * Per-agent driver/model configuration.
+ */
+export interface AgentConfig {
+  driver: string;
+  model: string;
+  options: Record<string, unknown>;
+}
+
+/**
+ * Resource limits for Daytona sandboxes.
+ */
+export interface DaytonaResources {
+  cpu: number;
+  memory: number;
+  disk: number;
+}
+
+/**
+ * Sandbox execution configuration for a profile.
+ */
+export interface SandboxConfig {
+  mode: 'none' | 'container' | 'daytona';
+  image: string;
+  network_allowlist_enabled: boolean;
+  network_allowed_hosts: string[];
+  // Remote sandbox fields (Daytona)
+  repo_url?: string;
+  daytona_api_url?: string;
+  daytona_target?: string;
+  daytona_resources?: DaytonaResources;
+  daytona_image?: string;
+}
+
+/**
+ * PR Auto-Fix configuration for automated review comment resolution.
+ */
+export interface PRAutoFixConfig {
+  aggressiveness: 'critical' | 'standard' | 'thorough' | 'exemplary';
+  poll_interval: number;
+  auto_resolve: boolean;
+  resolve_no_changes: boolean;
+  max_iterations: number;
+  commit_prefix: string;
+  ignore_authors: string[];
+  confidence_threshold: number;
+  post_push_cooldown_seconds: number;
+  max_cooldown_seconds: number;
+  poll_label: string | null;
+}
+
+/**
+ * Profile configuration for workflow execution.
+ * Each agent (architect, developer, reviewer) has its own driver/model config.
+ */
+export interface Profile {
+  id: string;
+  tracker: string;
+  repo_root: string;
+  plan_output_dir: string;
+  plan_path_pattern: string;
+  agents: Record<string, AgentConfig>;
+  sandbox?: SandboxConfig;
+  pr_autofix?: PRAutoFixConfig | null;
+  is_active: boolean;
+}
+
+/**
+ * Agent configuration for profile creation/update.
+ */
+export interface AgentConfigInput {
+  driver: string;
+  model: string;
+  options?: Record<string, unknown>;
+}
+
+/**
+ * Request payload for creating a new profile.
+ */
+export interface ProfileCreate {
+  id: string;
+  tracker?: string;
+  repo_root: string;
+  plan_output_dir?: string;
+  plan_path_pattern?: string;
+  agents: Record<string, AgentConfigInput>;
+  sandbox?: SandboxConfig;
+  pr_autofix?: PRAutoFixConfig | null;
+}
+
+/**
+ * Request payload for updating an existing profile.
+ */
+export interface ProfileUpdate {
+  tracker?: string;
+  repo_root?: string;
+  plan_output_dir?: string;
+  plan_path_pattern?: string;
+  agents?: Record<string, AgentConfigInput>;
+  sandbox?: SandboxConfig;
+  pr_autofix?: PRAutoFixConfig | null;
+}
+
+// =============================================================================
+// Settings API
+// =============================================================================
+
+/**
+ * Retrieves current server settings.
+ *
+ * @returns The current server settings configuration.
+ * @throws {Error} When the API request fails.
+ *
+ * @example
+ * ```typescript
+ * const settings = await getServerSettings();
+ * console.log(`Max concurrent: ${settings.max_concurrent}`);
+ * ```
+ */
+export async function getServerSettings(): Promise<ServerSettings> {
+  const response = await fetch(`${API_BASE_URL}/settings`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    signal: createTimeoutSignal(),
+  });
+  return handleResponse<ServerSettings>(response);
+}
+
+/**
+ * Updates server settings.
+ *
+ * @param updates - Partial settings to update.
+ * @returns The updated server settings.
+ * @throws {Error} When the API request fails.
+ *
+ * @example
+ * ```typescript
+ * const updated = await updateServerSettings({ max_concurrent: 10 });
+ * console.log(`New max concurrent: ${updated.max_concurrent}`);
+ * ```
+ */
+export async function updateServerSettings(
+  updates: Partial<ServerSettings>
+): Promise<ServerSettings> {
+  const response = await fetch(`${API_BASE_URL}/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+    signal: createTimeoutSignal(),
+  });
+  return handleResponse<ServerSettings>(response);
+}
+
+// =============================================================================
+// Profiles API
+// =============================================================================
+
+/**
+ * Retrieves all profiles.
+ *
+ * @param signal - Optional AbortSignal to cancel the request.
+ * @returns Array of all profile configurations.
+ * @throws {Error} When the API request fails.
+ *
+ * @example
+ * ```typescript
+ * const profiles = await getProfiles();
+ * console.log(`Found ${profiles.length} profiles`);
+ * ```
+ */
+export async function getProfiles(signal?: AbortSignal): Promise<Profile[]> {
+  const timeoutSignal = createTimeoutSignal();
+  const combinedSignal = signal
+    ? AbortSignal.any([timeoutSignal, signal])
+    : timeoutSignal;
+
+  const response = await fetch(`${API_BASE_URL}/profiles`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    signal: combinedSignal,
+  });
+  return handleResponse<Profile[]>(response);
+}
+
+/**
+ * Retrieves a single profile by ID.
+ *
+ * @param id - The unique identifier of the profile.
+ * @returns The profile configuration.
+ * @throws {Error} When the profile is not found or the API request fails.
+ *
+ * @example
+ * ```typescript
+ * const profile = await getProfile('work');
+ * console.log(`Driver: ${profile.driver}`);
+ * ```
+ */
+export async function getProfile(id: string): Promise<Profile> {
+  const response = await fetch(`${API_BASE_URL}/profiles/${encodeURIComponent(id)}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    signal: createTimeoutSignal(),
+  });
+  return handleResponse<Profile>(response);
+}
+
+/**
+ * Creates a new profile.
+ *
+ * @param profile - The profile configuration to create.
+ * @returns The created profile.
+ * @throws {Error} When validation fails or the API request fails.
+ *
+ * @example
+ * ```typescript
+ * const profile = await createProfile({
+ *   id: 'work',
+ *   driver: 'api',
+ *   model: 'anthropic/claude-3.5-sonnet',
+ *   validator_model: 'anthropic/claude-3.5-sonnet',
+ *   repo_root: '/Users/me/projects',
+ * });
+ * ```
+ */
+export async function createProfile(profile: ProfileCreate): Promise<Profile> {
+  const response = await fetch(`${API_BASE_URL}/profiles`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(profile),
+    signal: createTimeoutSignal(),
+  });
+  return handleResponse<Profile>(response);
+}
+
+/**
+ * Updates an existing profile.
+ *
+ * @param id - The unique identifier of the profile to update.
+ * @param updates - Partial profile updates to apply.
+ * @returns The updated profile.
+ * @throws {Error} When the profile is not found or the API request fails.
+ *
+ * @example
+ * ```typescript
+ * const updated = await updateProfile('work', { max_review_iterations: 5 });
+ * console.log(`Updated iterations: ${updated.max_review_iterations}`);
+ * ```
+ */
+export async function updateProfile(
+  id: string,
+  updates: ProfileUpdate
+): Promise<Profile> {
+  const response = await fetch(`${API_BASE_URL}/profiles/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+    signal: createTimeoutSignal(),
+  });
+  return handleResponse<Profile>(response);
+}
+
+/**
+ * Deletes a profile.
+ *
+ * @param id - The unique identifier of the profile to delete.
+ * @throws {Error} When the profile is not found or the API request fails.
+ *
+ * @example
+ * ```typescript
+ * await deleteProfile('old-profile');
+ * console.log('Profile deleted');
+ * ```
+ */
+export async function deleteProfile(id: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/profiles/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    signal: createTimeoutSignal(),
+  });
+  await handleResponse<void>(response);
+}
+
+/**
+ * Activates a profile, making it the default for new workflows.
+ *
+ * @param id - The unique identifier of the profile to activate.
+ * @returns The activated profile with is_active set to true.
+ * @throws {Error} When the profile is not found or the API request fails.
+ *
+ * @example
+ * ```typescript
+ * const active = await activateProfile('work');
+ * console.log(`Profile '${active.id}' is now active`);
+ * ```
+ */
+export async function activateProfile(id: string): Promise<Profile> {
+  const response = await fetch(
+    `${API_BASE_URL}/profiles/${encodeURIComponent(id)}/activate`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: createTimeoutSignal(),
+    }
+  );
+  return handleResponse<Profile>(response);
+}

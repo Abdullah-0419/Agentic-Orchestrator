@@ -1,0 +1,187 @@
+/**
+ * @fileoverview Client-side router configuration for the Amelia dashboard.
+ * Uses React Router v7 with data loaders and lazy-loaded route components.
+ */
+import { createBrowserRouter, Navigate } from 'react-router-dom';
+import { Layout } from '@/components/Layout';
+import { RootErrorBoundary } from '@/components/ErrorBoundary';
+import { workflowsLoader, workflowDetailLoader, historyLoader } from '@/loaders/workflows';
+import { promptsLoader } from '@/loaders/prompts';
+import { analyticsLoader, knowledgeLoader } from '@/loaders';
+import { profilesLoader, serverSettingsLoader } from '@/loaders/settings';
+import { approveAction, rejectAction, cancelAction, replanAction } from '@/actions/workflows';
+
+/**
+ * Application router with route definitions, loaders, and actions.
+ *
+ * Route structure:
+ * - `/` → Redirects to `/workflows`
+ * - `/workflows` → Active workflows list (lazy-loaded)
+ * - `/workflows/:id` → Active workflows list with specific workflow selected (lazy-loaded)
+ * - `/workflows/:id/detail` → Workflow detail view (lazy-loaded)
+ * - `/workflows/:id/approve` → Approve workflow action
+ * - `/workflows/:id/reject` → Reject workflow action
+ * - `/workflows/:id/cancel` → Cancel workflow action
+ * - `/workflows/:id/replan` → Replan blocked workflow action
+ * - `/history` → Completed workflows history (lazy-loaded)
+ * - `/logs` → System logs view (lazy-loaded)
+ * - `/prompts` → Prompts configuration page (lazy-loaded)
+ * - `/specs` → Spec Builder page (lazy-loaded)
+ * - `/develop` → Develop page for creating workflows (lazy-loaded)
+ * - `/knowledge` → Knowledge Library page (lazy-loaded)
+ * - `/settings` → Redirects to `/settings/profiles`
+ * - `/settings/profiles` → Profile management (lazy-loaded)
+ * - `/settings/server` → Server configuration (lazy-loaded)
+ * - `*` → Fallback redirect to `/workflows`
+ *
+ * All page components are lazy-loaded for optimal initial bundle size.
+ */
+export const router = createBrowserRouter([
+  {
+    path: '/',
+    element: <Layout />,
+    errorElement: <RootErrorBoundary />,
+    children: [
+      {
+        index: true,
+        element: <Navigate to="/workflows" replace />
+      },
+      {
+        path: 'workflows',
+        children: [
+          {
+            index: true,
+            loader: workflowsLoader,
+            lazy: async () => {
+              const { default: Component } = await import('@/pages/WorkflowsPage');
+              return { Component };
+            },
+          },
+          {
+            path: ':id',
+            loader: workflowsLoader,
+            lazy: async () => {
+              const { default: Component } = await import('@/pages/WorkflowsPage');
+              return { Component };
+            },
+          },
+          {
+            path: ':id/detail',
+            loader: workflowDetailLoader,
+            lazy: async () => {
+              const { default: Component } = await import('@/pages/WorkflowDetailPage');
+              return { Component };
+            },
+          },
+        ],
+      },
+      {
+        path: 'workflows/:id/approve',
+        action: approveAction,
+      },
+      {
+        path: 'workflows/:id/reject',
+        action: rejectAction,
+      },
+      {
+        path: 'workflows/:id/cancel',
+        action: cancelAction,
+      },
+      {
+        path: 'workflows/:id/replan',
+        action: replanAction,
+      },
+      {
+        path: 'history',
+        loader: historyLoader,
+        lazy: async () => {
+          const { default: Component } = await import('@/pages/HistoryPage');
+          return { Component };
+        },
+      },
+      {
+        path: 'logs',
+        lazy: async () => {
+          const { default: Component } = await import('@/pages/LogsPage');
+          return { Component };
+        },
+      },
+      {
+        path: 'develop',
+        async lazy() {
+          const { default: Component } = await import('@/pages/DevelopPage');
+          return { Component };
+        },
+      },
+      {
+        path: 'prompts',
+        loader: promptsLoader,
+        lazy: async () => {
+          const { default: Component } = await import('@/pages/PromptConfigPage');
+          return { Component };
+        },
+      },
+      {
+        path: 'specs',
+        lazy: async () => {
+          const { default: Component } = await import('@/pages/SpecBuilderPage');
+          return { Component };
+        },
+      },
+      {
+        path: 'analytics',
+        loader: analyticsLoader,
+        lazy: async () => {
+          const { default: Component } = await import('@/pages/AnalyticsPage');
+          return { Component };
+        },
+      },
+      {
+        path: 'costs',
+        element: <Navigate to="/analytics" replace />,
+      },
+      {
+        path: 'knowledge',
+        loader: knowledgeLoader,
+        errorElement: <RootErrorBoundary />,
+        lazy: async () => {
+          const { default: Component } = await import('@/pages/KnowledgePage');
+          return { Component };
+        },
+      },
+      {
+        path: 'settings',
+        lazy: async () => {
+          const { SettingsLayout } = await import('@/components/settings/SettingsLayout');
+          return { Component: SettingsLayout };
+        },
+        children: [
+          {
+            index: true,
+            element: <Navigate to="/settings/profiles" replace />,
+          },
+          {
+            path: 'profiles',
+            loader: profilesLoader,
+            lazy: async () => {
+              const { default: Component } = await import('@/pages/SettingsProfilesPage');
+              return { Component };
+            },
+          },
+          {
+            path: 'server',
+            loader: serverSettingsLoader,
+            lazy: async () => {
+              const { default: Component } = await import('@/pages/SettingsServerPage');
+              return { Component };
+            },
+          },
+        ],
+      },
+      {
+        path: '*',
+        element: <Navigate to="/workflows" replace />,
+      },
+    ],
+  },
+]);

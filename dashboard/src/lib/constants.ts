@@ -1,0 +1,263 @@
+/**
+ * @fileoverview Application-wide constants and configuration values.
+ *
+ * Centralizes version info, agent definitions, and other constants.
+ */
+
+import {
+  Brain,
+  Code,
+  Search,
+  FileCheck,
+  ClipboardCheck,
+  Scale,
+  Lightbulb,
+  type LucideIcon,
+} from 'lucide-react';
+
+import packageJson from '../../package.json';
+
+/** Current application version from package.json. */
+export const APP_VERSION = packageJson.version;
+
+/**
+ * Agent capability requirements for model filtering.
+ */
+export interface AgentRequirements {
+  capabilities: ('tool_call' | 'reasoning' | 'structured_output')[];
+  minContext: number;
+  priceTier: 'budget' | 'standard' | 'premium' | 'any';
+}
+
+/**
+ * Agent-specific model requirements.
+ * All agents require tool_call. Secondary capabilities vary.
+ */
+export const AGENT_MODEL_REQUIREMENTS: Record<string, AgentRequirements> = {
+  architect: {
+    capabilities: ['tool_call', 'reasoning', 'structured_output'],
+    minContext: 200_000,
+    priceTier: 'any',
+  },
+  developer: {
+    capabilities: ['tool_call', 'structured_output'],
+    minContext: 200_000,
+    priceTier: 'any',
+  },
+  reviewer: {
+    capabilities: ['tool_call', 'reasoning'],
+    minContext: 128_000,
+    priceTier: 'any',
+  },
+  plan_validator: {
+    capabilities: ['tool_call', 'structured_output'],
+    minContext: 64_000,
+    priceTier: 'budget',
+  },
+  task_reviewer: {
+    capabilities: ['tool_call', 'reasoning'],
+    minContext: 64_000,
+    priceTier: 'budget',
+  },
+  evaluator: {
+    capabilities: ['tool_call', 'structured_output'],
+    minContext: 64_000,
+    priceTier: 'budget',
+  },
+  brainstormer: {
+    capabilities: ['tool_call', 'reasoning'],
+    minContext: 64_000,
+    priceTier: 'standard',
+  },
+};
+
+// =============================================================================
+// Agent Definitions
+// =============================================================================
+
+export interface AgentDefinition {
+  key: string;
+  label: string;
+  description: string;
+  icon: LucideIcon;
+  defaultModel: string;
+  category: 'primary' | 'utility';
+}
+
+/** All agents in the system with their metadata. */
+export const AGENT_DEFINITIONS: AgentDefinition[] = [
+  // Primary agents - always visible
+  {
+    key: 'architect',
+    label: 'Architect',
+    description: 'Plans implementation strategy',
+    icon: Brain,
+    defaultModel: 'opus',
+    category: 'primary',
+  },
+  {
+    key: 'developer',
+    label: 'Developer',
+    description: 'Writes and modifies code',
+    icon: Code,
+    defaultModel: 'opus',
+    category: 'primary',
+  },
+  {
+    key: 'reviewer',
+    label: 'Reviewer',
+    description: 'Reviews code changes',
+    icon: Search,
+    defaultModel: 'sonnet',
+    category: 'primary',
+  },
+  // Utility agents - collapsed by default
+  {
+    key: 'plan_validator',
+    label: 'Plan Validator',
+    description: 'Validates plan structure',
+    icon: FileCheck,
+    defaultModel: 'haiku',
+    category: 'utility',
+  },
+  {
+    key: 'task_reviewer',
+    label: 'Task Reviewer',
+    description: 'Reviews individual tasks',
+    icon: ClipboardCheck,
+    defaultModel: 'haiku',
+    category: 'utility',
+  },
+  {
+    key: 'evaluator',
+    label: 'Evaluator',
+    description: 'Evaluates review quality',
+    icon: Scale,
+    defaultModel: 'haiku',
+    category: 'utility',
+  },
+  {
+    key: 'brainstormer',
+    label: 'Brainstormer',
+    description: 'Generates creative ideas',
+    icon: Lightbulb,
+    defaultModel: 'haiku',
+    category: 'utility',
+  },
+];
+
+/** Primary agent keys used across the UI. */
+export const PRIMARY_AGENT_KEYS = ['architect', 'developer', 'reviewer'] as const;
+
+/** Style mapping for different agent types in activity logs and UI. */
+export const AGENT_STYLES: Record<string, { text: string; bg: string }> = {
+  PM: { text: 'text-agent-pm', bg: 'bg-agent-pm-bg' },
+  ORCHESTRATOR: { text: 'text-muted-foreground', bg: '' },
+  ARCHITECT: { text: 'text-agent-architect', bg: 'bg-agent-architect-bg' },
+  DEVELOPER: { text: 'text-agent-developer', bg: 'bg-agent-developer-bg' },
+  REVIEWER: { text: 'text-agent-reviewer', bg: 'bg-agent-reviewer-bg' },
+  VALIDATOR: { text: 'text-agent-pm', bg: 'bg-agent-pm-bg' },
+  EVALUATOR: { text: 'text-agent-pm', bg: 'bg-agent-pm-bg' },
+  HUMAN_APPROVAL: { text: 'text-destructive', bg: 'bg-destructive/10' },
+  SYSTEM: { text: 'text-muted-foreground', bg: '' },
+};
+
+/** Agent accent style definition. */
+export interface AgentAccentStyle {
+  border: string;
+  shadow: string;
+  headerGradient: string;
+  iconBg: string;
+  iconText: string;
+  focusRing: string;
+  button: string;
+  buttonShadow: string;
+}
+
+/** Extended style mapping for agent modal accents (borders, shadows, buttons). */
+const AGENT_ACCENT_STYLES_MAP: Record<string, AgentAccentStyle> = {
+  architect: {
+    border: 'border-agent-architect/20',
+    shadow: 'shadow-agent-architect/10 dark:shadow-agent-architect/5',
+    headerGradient: 'from-agent-architect/5 via-transparent to-agent-architect/5',
+    iconBg: 'bg-agent-architect/10',
+    iconText: 'text-agent-architect',
+    focusRing: 'focus-visible:border-agent-architect/50 focus-visible:ring-agent-architect/20',
+    button: 'bg-agent-architect hover:bg-agent-architect/90',
+    buttonShadow: 'shadow-agent-architect/25',
+  },
+  developer: {
+    border: 'border-agent-developer/20',
+    shadow: 'shadow-agent-developer/10 dark:shadow-agent-developer/5',
+    headerGradient: 'from-agent-developer/5 via-transparent to-agent-developer/5',
+    iconBg: 'bg-agent-developer/10',
+    iconText: 'text-agent-developer',
+    focusRing: 'focus-visible:border-agent-developer/50 focus-visible:ring-agent-developer/20',
+    button: 'bg-agent-developer hover:bg-agent-developer/90 text-background',
+    buttonShadow: 'shadow-agent-developer/25',
+  },
+  reviewer: {
+    border: 'border-agent-reviewer/20',
+    shadow: 'shadow-agent-reviewer/10 dark:shadow-agent-reviewer/5',
+    headerGradient: 'from-agent-reviewer/5 via-transparent to-agent-reviewer/5',
+    iconBg: 'bg-agent-reviewer/10',
+    iconText: 'text-agent-reviewer',
+    focusRing: 'focus-visible:border-agent-reviewer/50 focus-visible:ring-agent-reviewer/20',
+    button: 'bg-agent-reviewer hover:bg-agent-reviewer/90 text-white',
+    buttonShadow: 'shadow-agent-reviewer/25',
+  },
+  evaluator: {
+    border: 'border-agent-pm/20',
+    shadow: 'shadow-agent-pm/10 dark:shadow-agent-pm/5',
+    headerGradient: 'from-agent-pm/5 via-transparent to-agent-pm/5',
+    iconBg: 'bg-agent-pm/10',
+    iconText: 'text-agent-pm',
+    focusRing: 'focus-visible:border-agent-pm/50 focus-visible:ring-agent-pm/20',
+    button: 'bg-agent-pm hover:bg-agent-pm/90 text-white',
+    buttonShadow: 'shadow-agent-pm/25',
+  },
+  plan_validator: {
+    border: 'border-agent-pm/20',
+    shadow: 'shadow-agent-pm/10 dark:shadow-agent-pm/5',
+    headerGradient: 'from-agent-pm/5 via-transparent to-agent-pm/5',
+    iconBg: 'bg-agent-pm/10',
+    iconText: 'text-agent-pm',
+    focusRing: 'focus-visible:border-agent-pm/50 focus-visible:ring-agent-pm/20',
+    button: 'bg-agent-pm hover:bg-agent-pm/90 text-white',
+    buttonShadow: 'shadow-agent-pm/25',
+  },
+  human_approval: {
+    border: 'border-destructive/20',
+    shadow: 'shadow-destructive/10 dark:shadow-destructive/5',
+    headerGradient: 'from-destructive/5 via-transparent to-destructive/5',
+    iconBg: 'bg-destructive/10',
+    iconText: 'text-destructive',
+    focusRing: 'focus-visible:border-destructive/50 focus-visible:ring-destructive/20',
+    button: 'bg-destructive hover:bg-destructive/90 text-white',
+    buttonShadow: 'shadow-destructive/25',
+  },
+};
+
+/** Default accent style for unknown agents (architect/blue). */
+export const DEFAULT_ACCENT_STYLE: AgentAccentStyle = {
+  border: 'border-agent-architect/20',
+  shadow: 'shadow-agent-architect/10 dark:shadow-agent-architect/5',
+  headerGradient: 'from-agent-architect/5 via-transparent to-agent-architect/5',
+  iconBg: 'bg-agent-architect/10',
+  iconText: 'text-agent-architect',
+  focusRing:
+    'focus-visible:border-agent-architect/50 focus-visible:ring-agent-architect/20',
+  button: 'bg-agent-architect hover:bg-agent-architect/90',
+  buttonShadow: 'shadow-agent-architect/25',
+};
+
+/**
+ * Get accent style for an agent, with fallback to default.
+ * Always returns a defined style.
+ *
+ * @param agent - The agent type identifier (e.g., "architect", "developer", "reviewer").
+ * @returns The AgentAccentStyle object for the specified agent, or DEFAULT_ACCENT_STYLE if not found.
+ */
+export function getAgentAccentStyle(agent: string): AgentAccentStyle {
+  return AGENT_ACCENT_STYLES_MAP[agent] ?? DEFAULT_ACCENT_STYLE;
+}

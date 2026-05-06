@@ -1,0 +1,515 @@
+/**
+ * @fileoverview Reusable collapsible section for importing external plans.
+ */
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { ChevronDown, FileText, ClipboardPaste, File, Eye, Loader2, AlertCircle, ChevronsUpDown, Check } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { parsePlanPreview, type PlanPreview } from '@/lib/plan-parser';
+import { api, ApiError } from '@/api/client';
+import type { FileEntry } from '@/types';
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from '@/components/ui/command';
+import { toast } from 'sonner';
+
+/**
+ * Plan data passed to parent component.
+ */
+export interface PlanData {
+  /** Path to external plan file (relative to worktree). */
+  plan_file?: string;
+  /** Inline plan markdown content. */
+  plan_content?: string;
+  /** Title extracted from the first H1 in the plan/design markdown. */
+  extracted_title?: string;
+}
+
+export interface PlanImportSectionProps {
+  /** Callback when plan data changes. */
+  onPlanChange: (data: PlanData) => void;
+  /** Whether the section is expanded by default. */
+  defaultExpanded?: boolean;
+  /** Error message to display. */
+  error?: string;
+  /** Worktree path for resolving relative file paths. Enables Preview button in file mode. */
+  worktreePath?: string;
+  /** Directory to list plan files from (relative to worktree). */
+  planOutputDir?: string;
+  /** Additional CSS classes. */
+  className?: string;
+}
+
+type InputMode = 'file' | 'paste';
+
+/**
+ * Formats an ISO date string as a human-readable relative time.
+ */
+function formatRelativeTime(isoDate: string): string {
+  const diff = Date.now() - new Date(isoDate).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(isoDate).toLocaleDateString();
+}
+
+/**
+ * Collapsible section for importing external plans via file path or pasted content.
+ */
+export function PlanImportSection({
+  onPlanChange,
+  defaultExpanded = false,
+  error,
+  worktreePath,
+  planOutputDir,
+  className,
+}: PlanImportSectionProps) {
+  const [isOpen, setIsOpen] = useState(defaultExpanded);
+  const [mode, setMode] = useState<InputMode>('file');
+  const [filePath, setFilePath] = useState('');
+  const [content, setContent] = useState('');
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [preview, setPreview] = useState<PlanPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [filePreview, setFilePreview] = useState<PlanPreview | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [files, setFiles] = useState<FileEntry[]>([]);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [comboboxOpen, setComboboxOpen] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<FileEntry | null>(null);
+  const isInitialMount = useRef(true);
+  const previewRequestId = useRef(0);
+
+  // Update preview when content changes
+  useEffect(() => {
+    if (mode === 'paste' && content.trim()) {
+      const parsed = parsePlanPreview(content);
+      // Only show preview if we extracted something meaningful
+      if (parsed.goal || parsed.taskCount > 0 || parsed.keyFiles.length > 0) {
+        setPreview(parsed);
+      } else {
+        setPreview(null);
+      }
+    } else {
+      setPreview(null);
+    }
+  }, [mode, content]);
+
+  // Notify parent of changes (skip initial mount to avoid unnecessary callback)
+  useEffect(() => {
+    if (isInitialMount.current) {
+      isInitialMount.current = false;
+      return;
+    }
+    if (mode === 'file') {
+      onPlanChange({
+        plan_file: filePath.trim() || undefined,
+        plan_content: undefined,
+        extracted_title: filePreview?.title,
+      });
+    } else {
+      onPlanChange({
+        plan_file: undefined,
+        plan_content: content.trim() || undefined,
+        extracted_title: preview?.title,
+      });
+    }
+  }, [mode, filePath, content, filePreview, preview, onPlanChange]);
+
+  // Fetch file list when in file mode and planOutputDir is available
+  useEffect(() => {
+    if (mode !== 'file' || !planOutputDir || !worktreePath) return;
+
+    setFilesLoading(true);
+    setFileError(null); // Clear previous errors
+    api.listFiles(planOutputDir, '*.md', worktreePath)
+      .then((res) => {
+        setFiles(res.files);
+        if (res.files.length === 0) {
+          console.warn(`No .md files found in ${planOutputDir}`);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to list plan files:', err);
+        setFiles([]);
+
+        // Show helpful error message to user
+        const errorMsg = err instanceof ApiError
+          ? err.message
+          : 'Failed to load plan files';
+
+        if (errorMsg.includes('No active profile')) {
+          setFileError('No active profile set. Please create and activate a profile in Settings.');
+          toast.error('Cannot list files: No active profile set');
+        } else {
+          setFileError(errorMsg);
+          toast.error(`Failed to load plan files: ${errorMsg}`);
+        }
+      })
+      .finally(() => setFilesLoading(false));
+  }, [mode, planOutputDir, worktreePath]);
+
+  const handleModeChange = useCallback((value: string) => {
+    if (value) {
+      setMode(value as InputMode);
+    }
+  }, []);
+
+  const handleFilePathChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      setFilePath(e.target.value);
+      setFilePreview(null);
+      setFileError(null);
+      previewRequestId.current += 1;
+      setPreviewLoading(false);
+    },
+    []
+  );
+
+  const handleFileSelect = useCallback((file: FileEntry) => {
+    setSelectedFile(file);
+    const relativePath = planOutputDir
+      ? `${planOutputDir.replace(/\/$/, '')}/${file.name}`
+      : file.relative_path;
+    setFilePath(relativePath);
+    setFilePreview(null);
+    setFileError(null);
+    // Defer popover close to let cmdk finish processing the click event
+    requestAnimationFrame(() => setComboboxOpen(false));
+  }, [planOutputDir]);
+
+  const handlePreview = useCallback(async () => {
+    const trimmedPath = filePath.trim();
+    if (!trimmedPath || !worktreePath) return;
+
+    const requestId = ++previewRequestId.current;
+    setPreviewLoading(true);
+    setFileError(null);
+    setFilePreview(null);
+
+    try {
+      const absolutePath = trimmedPath.startsWith('/')
+        ? trimmedPath
+        : `${worktreePath.replace(/\/$/, '')}/${trimmedPath}`;
+
+      const response = await api.readFile(absolutePath, worktreePath);
+      if (requestId !== previewRequestId.current) return;
+
+      if (!response.content.trim()) {
+        setFileError('Plan file is empty');
+        return;
+      }
+
+      const parsed = parsePlanPreview(response.content);
+      if (parsed.title || parsed.goal || parsed.taskCount > 0 || parsed.keyFiles.length > 0) {
+        setFilePreview(parsed);
+      } else {
+        setFileError('Could not extract plan information from file');
+      }
+    } catch (err) {
+      if (requestId !== previewRequestId.current) return;
+      if (err instanceof ApiError) {
+        setFileError(err.message);
+      } else {
+        setFileError('Failed to read plan file');
+      }
+    } finally {
+      if (requestId === previewRequestId.current) {
+        setPreviewLoading(false);
+      }
+    }
+  }, [filePath, worktreePath]);
+
+  const handleContentChange = useCallback(
+    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+      setContent(e.target.value);
+    },
+    []
+  );
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+  }, []);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+
+    const files = Array.from(e.dataTransfer.files);
+    const mdFile = files.find((f) => f.name.endsWith('.md'));
+
+    if (!mdFile) {
+      return;
+    }
+
+    try {
+      const text = await mdFile.text();
+      setContent(text);
+    } catch {
+      toast.error('Failed to read file');
+    }
+  }, []);
+
+  // Auto-trigger preview when a file is selected from the combobox
+  const selectedFileRef = useRef<FileEntry | null>(null);
+  useEffect(() => {
+    if (selectedFile && selectedFile !== selectedFileRef.current && filePath.trim() && worktreePath) {
+      selectedFileRef.current = selectedFile;
+      handlePreview();
+    }
+  }, [selectedFile, filePath, worktreePath, handlePreview]);
+
+  // Derived state: select active preview based on current input mode
+  const activePreview = mode === 'paste' ? preview : filePreview;
+
+  return (
+    <Collapsible
+      open={isOpen}
+      onOpenChange={setIsOpen}
+      className={cn('border border-border rounded-lg', className)}
+    >
+      <CollapsibleTrigger className="flex items-center justify-between w-full px-4 py-3 hover:bg-muted/50 transition-colors rounded-lg">
+        <div className="flex items-center gap-2">
+          <FileText className="w-4 h-4 text-muted-foreground" />
+          <span className="text-sm font-medium">External Plan</span>
+        </div>
+        <ChevronDown
+          className={cn(
+            'w-4 h-4 text-muted-foreground transition-transform',
+            isOpen && 'rotate-180'
+          )}
+        />
+      </CollapsibleTrigger>
+
+      <CollapsibleContent className="px-4 pb-4 space-y-4">
+        {/* Mode toggle */}
+        <ToggleGroup
+          type="single"
+          value={mode}
+          onValueChange={handleModeChange}
+          className="w-full"
+        >
+          <ToggleGroupItem
+            value="file"
+            aria-label="File path"
+            className="flex-1 gap-2"
+          >
+            <File className="w-4 h-4" />
+            File
+          </ToggleGroupItem>
+          <ToggleGroupItem
+            value="paste"
+            aria-label="Paste content"
+            className="flex-1 gap-2"
+          >
+            <ClipboardPaste className="w-4 h-4" />
+            Paste
+          </ToggleGroupItem>
+        </ToggleGroup>
+
+        {/* File path input */}
+        {mode === 'file' && (
+          <div className="space-y-2">
+            {worktreePath && planOutputDir ? (
+              /* Combobox for browsing plan files */
+              <div className="flex gap-2">
+                <Popover open={comboboxOpen} onOpenChange={setComboboxOpen}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      role="combobox"
+                      aria-expanded={comboboxOpen}
+                      className="w-full justify-between font-mono text-sm"
+                      disabled={filesLoading}
+                    >
+                      {filesLoading ? (
+                        <span className="flex items-center gap-2 text-muted-foreground">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Loading files...
+                        </span>
+                      ) : selectedFile ? (
+                        <span className="truncate">{selectedFile.name}</span>
+                      ) : (
+                        <span className="text-muted-foreground">Select a plan file...</span>
+                      )}
+                      <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0 z-[250]" align="start">
+                    <Command>
+                      <CommandInput placeholder="Search files..." />
+                      <CommandList>
+                        <CommandEmpty>No .md files found in {planOutputDir}</CommandEmpty>
+                        <CommandGroup>
+                          {files.map((file) => (
+                            <CommandItem
+                              key={file.relative_path}
+                              value={file.name}
+                              onSelect={() => handleFileSelect(file)}
+                              className="font-mono text-xs"
+                            >
+                              <Check
+                                className={cn(
+                                  'mr-2 h-4 w-4',
+                                  selectedFile?.relative_path === file.relative_path
+                                    ? 'opacity-100'
+                                    : 'opacity-0'
+                                )}
+                              />
+                              <span className="flex-1 truncate">{file.name}</span>
+                              <span className="text-muted-foreground text-xs ml-2">
+                                {formatRelativeTime(file.modified_at)}
+                              </span>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+                {worktreePath && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={!filePath.trim() || previewLoading}
+                    onClick={handlePreview}
+                    aria-label="Preview plan"
+                    className="shrink-0"
+                  >
+                    {previewLoading ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Eye className="w-4 h-4" />
+                    )}
+                  </Button>
+                )}
+              </div>
+            ) : (
+              /* Fallback: text input when no planOutputDir or worktreePath */
+              <div className="flex gap-2">
+                <Input
+                  type="text"
+                  placeholder="Relative path to plan file (e.g., docs/plan.md)"
+                  value={filePath}
+                  onChange={handleFilePathChange}
+                  className="flex-1"
+                />
+                {worktreePath && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={!filePath.trim() || previewLoading}
+                    onClick={handlePreview}
+                    aria-label="Preview plan"
+                    className="shrink-0"
+                  >
+                    {previewLoading ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Eye className="w-4 h-4" />
+                    )}
+                  </Button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Paste content textarea */}
+        {mode === 'paste' && (
+          <div
+            data-testid="plan-import-drop-zone"
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            className={cn(
+              'rounded-md transition-colors',
+              isDragOver && 'border-primary bg-primary/5'
+            )}
+          >
+            <Textarea
+              placeholder="Paste your plan markdown here..."
+              value={content}
+              onChange={handleContentChange}
+              rows={8}
+              className={cn(
+                'min-h-[150px]',
+                isDragOver && 'border-primary'
+              )}
+            />
+          </div>
+        )}
+
+        {/* Error display */}
+        {(error || (mode === 'file' && fileError)) && (
+          <Alert variant="destructive">
+            <AlertCircle className="w-4 h-4" />
+            <AlertDescription>
+              {error || (mode === 'file' ? fileError : null)}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Plan preview */}
+        {activePreview && (activePreview.goal || activePreview.taskCount > 0 || activePreview.keyFiles.length > 0) && (
+          <div
+            data-testid="plan-preview"
+            className="border border-border rounded-lg p-3 bg-muted/30 space-y-2"
+          >
+            {activePreview.goal && (
+              <div>
+                <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                  Goal
+                </span>
+                <p className="text-sm mt-0.5 line-clamp-2">{activePreview.goal}</p>
+              </div>
+            )}
+            <div className="flex items-center gap-4 text-sm text-muted-foreground">
+              {activePreview.taskCount > 0 && (
+                <span>{activePreview.taskCount} tasks</span>
+              )}
+              {activePreview.keyFiles.length > 0 && (
+                <span className="truncate">
+                  {activePreview.keyFiles[0]}
+                  {activePreview.keyFiles.length > 1 &&
+                    ` +${activePreview.keyFiles.length - 1} more`}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}

@@ -1,0 +1,1 @@
+export { truncateWorkflowId } from './format';

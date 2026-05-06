@@ -1,0 +1,282 @@
+"""Tests for ProfileRepository."""
+
+import json
+
+import pytest
+
+from amelia.core.types import AgentConfig, Profile
+from amelia.server.database.connection import Database
+from amelia.server.database.profile_repository import ProfileRecord, ProfileRepository
+
+
+pytestmark = pytest.mark.integration
+
+
+def _make_agents_json(
+    driver: str = "claude",
+    model: str = "opus",
+    validator_model: str = "haiku",
+) -> str:
+    """Create agents JSON blob for tests."""
+    return json.dumps({
+        "architect": {"driver": driver, "model": model, "options": {}},
+        "developer": {"driver": driver, "model": model, "options": {}},
+        "reviewer": {"driver": driver, "model": validator_model, "options": {}},
+    })
+
+
+def _make_agents(
+    driver: str = "claude",
+    model: str = "opus",
+    validator_model: str = "haiku",
+) -> dict[str, AgentConfig]:
+    """Create agents dict for Profile."""
+    return {
+        "architect": AgentConfig(driver=driver, model=model),
+        "developer": AgentConfig(driver=driver, model=model),
+        "reviewer": AgentConfig(driver=driver, model=validator_model),
+    }
+
+
+def test_profile_record_with_agents_json():
+    """ProfileRecord should store agents as JSON."""
+    agents = {
+        "architect": {"driver": "claude", "model": "opus", "options": {}},
+        "developer": {"driver": "claude", "model": "sonnet", "options": {}},
+    }
+
+    record = ProfileRecord(
+        id="test",
+        tracker="noop",
+        repo_root="/tmp/test",
+        agents=json.dumps(agents),
+    )
+
+    assert record.agents is not None
+    parsed = json.loads(record.agents)
+    assert parsed["architect"]["model"] == "opus"
+
+
+@pytest.mark.asyncio
+async def test_get_profile_parses_agents_jsonb_into_agent_config(db_with_schema):
+    """Reading a profile back through the public API parses agents JSONB
+    into AgentConfig instances (exercises _row_to_profile).
+    """
+    repo = ProfileRepository(db_with_schema)
+
+    await repo.create_profile(
+        Profile(
+            name="test",
+            tracker="noop",
+            repo_root="/tmp/test",
+            agents={
+                "architect": AgentConfig(driver="claude", model="opus"),
+                "developer": AgentConfig(driver="claude", model="sonnet"),
+            },
+        )
+    )
+
+    profile = await repo.get_profile("test")
+
+    assert isinstance(profile, Profile)
+    assert "architect" in profile.agents
+    assert profile.agents["architect"].model == "opus"
+    assert isinstance(profile.agents["architect"], AgentConfig)
+
+
+@pytest.mark.asyncio
+async def test_create_profile_stores_agents_json(db_with_schema):
+    """create_profile should serialize agents dict to JSON."""
+    repo = ProfileRepository(db_with_schema)
+
+    profile = Profile(
+        name="test_agents",
+        tracker="noop",
+        repo_root="/tmp/test",
+        agents={
+            "architect": AgentConfig(driver="claude", model="opus"),
+            "developer": AgentConfig(driver="api", model="anthropic/claude-sonnet-4"),
+        },
+    )
+
+    await repo.create_profile(profile)
+
+    # Retrieve and verify
+    retrieved = await repo.get_profile("test_agents")
+    assert retrieved is not None
+    assert retrieved.agents["architect"].model == "opus"
+    assert retrieved.agents["developer"].driver == "api"
+
+
+class TestProfileRepository:
+    """Tests for ProfileRepository CRUD operations."""
+
+    @pytest.fixture
+    async def db(self, db_with_schema: Database) -> Database:
+        """Use the shared PostgreSQL database with schema."""
+        return db_with_schema
+
+    @pytest.fixture
+    def repo(self, db: Database) -> ProfileRepository:
+        """Create a ProfileRepository instance."""
+        return ProfileRepository(db)
+
+    async def test_create_profile(self, repo: ProfileRepository):
+        """Verify profile creation."""
+        profile = await repo.create_profile(
+            Profile(
+                name="dev",
+                tracker="noop",
+                repo_root="/path/to/repo",
+                agents=_make_agents(driver="claude", model="opus"),
+            )
+        )
+        # Repository returns Profile (converted from DB)
+        assert profile.name == "dev"
+        assert profile.agents["architect"].driver == "claude"
+
+    async def test_get_profile(self, repo: ProfileRepository):
+        """Verify profile retrieval."""
+        await repo.create_profile(
+            Profile(
+                name="dev",
+                tracker="noop",
+                repo_root="/path/to/repo",
+                agents=_make_agents(model="opus"),
+            )
+        )
+        profile = await repo.get_profile("dev")
+        assert profile is not None
+        assert profile.agents["architect"].model == "opus"
+
+    async def test_get_profile_not_found(self, repo: ProfileRepository):
+        """Verify None returned for missing profile."""
+        profile = await repo.get_profile("nonexistent")
+        assert profile is None
+
+    async def test_list_profiles(self, repo: ProfileRepository):
+        """Verify listing all profiles."""
+        await repo.create_profile(
+            Profile(
+                name="dev",
+                tracker="noop",
+                repo_root="/repo1",
+                agents=_make_agents(driver="claude", model="opus"),
+            )
+        )
+        await repo.create_profile(
+            Profile(
+                name="prod",
+                tracker="jira",
+                repo_root="/repo2",
+                agents=_make_agents(driver="api", model="gpt-4"),
+            )
+        )
+        profiles = await repo.list_profiles()
+        assert len(profiles) == 2
+        names = {p.name for p in profiles}
+        assert names == {"dev", "prod"}
+
+    async def test_update_profile(self, repo: ProfileRepository):
+        """Verify profile updates."""
+        await repo.create_profile(
+            Profile(
+                name="dev",
+                tracker="noop",
+                repo_root="/repo",
+                agents=_make_agents(model="opus"),
+            )
+        )
+        # update_profile accepts dict for agents (JSONB codec handles encoding)
+        new_agents = {
+            "architect": {"driver": "claude", "model": "sonnet", "options": {}},
+            "developer": {"driver": "claude", "model": "sonnet", "options": {}},
+            "reviewer": {"driver": "claude", "model": "haiku", "options": {}},
+        }
+        updated = await repo.update_profile("dev", {"agents": new_agents})
+        assert updated.agents["architect"].model == "sonnet"
+
+        # Verify persistence
+        fetched = await repo.get_profile("dev")
+        assert fetched.agents["architect"].model == "sonnet"
+
+    async def test_delete_profile(self, repo: ProfileRepository):
+        """Verify profile deletion."""
+        await repo.create_profile(
+            Profile(
+                name="dev",
+                tracker="noop",
+                repo_root="/repo",
+                agents=_make_agents(),
+            )
+        )
+        result = await repo.delete_profile("dev")
+        assert result is True
+        assert await repo.get_profile("dev") is None
+
+    async def test_delete_profile_not_found(self, repo: ProfileRepository):
+        """Verify delete returns False for missing profile."""
+        result = await repo.delete_profile("nonexistent")
+        assert result is False
+
+    async def test_set_active(self, repo: ProfileRepository):
+        """Verify setting active profile."""
+        await repo.create_profile(
+            Profile(
+                name="dev",
+                tracker="noop",
+                repo_root="/repo",
+                agents=_make_agents(),
+            )
+        )
+        await repo.set_active("dev")
+        # Note: Profile doesn't have is_active field - we verify via get_active_profile
+        active = await repo.get_active_profile()
+        assert active is not None
+        assert active.name == "dev"
+
+    async def test_set_active_deactivates_others(self, repo: ProfileRepository):
+        """Verify setting active profile deactivates others."""
+        await repo.create_profile(
+            Profile(
+                name="dev",
+                tracker="noop",
+                repo_root="/repo1",
+                agents=_make_agents(driver="claude", model="opus"),
+            )
+        )
+        await repo.create_profile(
+            Profile(
+                name="prod",
+                tracker="jira",
+                repo_root="/repo2",
+                agents=_make_agents(driver="api", model="gpt-4"),
+            )
+        )
+        await repo.set_active("dev")
+        await repo.set_active("prod")
+
+        # Only prod should be active now
+        active = await repo.get_active_profile()
+        assert active is not None
+        assert active.name == "prod"
+
+    async def test_get_active_profile(self, repo: ProfileRepository):
+        """Verify getting the active profile."""
+        await repo.create_profile(
+            Profile(
+                name="dev",
+                tracker="noop",
+                repo_root="/repo",
+                agents=_make_agents(),
+            )
+        )
+        await repo.set_active("dev")
+        active = await repo.get_active_profile()
+        assert active is not None
+        assert active.name == "dev"
+
+    async def test_get_active_profile_none(self, repo: ProfileRepository):
+        """Verify None when no active profile."""
+        active = await repo.get_active_profile()
+        assert active is None

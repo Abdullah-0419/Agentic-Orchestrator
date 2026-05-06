@@ -1,0 +1,535 @@
+"""Unit tests for external plan import helper."""
+
+from pathlib import Path
+from unittest.mock import patch
+from uuid import uuid4
+
+import pytest
+
+from amelia.core.types import AgentConfig, Profile
+from amelia.pipelines.implementation.external_plan import (
+    ExternalPlanImportResult,
+    extract_plan_fields,
+    import_external_plan,
+    read_plan_content,
+    write_plan_to_target,
+)
+
+
+class TestImportExternalPlan:
+    """Tests for import_external_plan helper function."""
+
+    @pytest.fixture
+    def mock_profile(self, tmp_path: Path) -> Profile:
+        """Create mock profile for testing."""
+        return Profile(
+            name="test",
+            tracker="noop",
+            repo_root=str(tmp_path / "worktree"),
+            agents={
+                "plan_validator": AgentConfig(driver="claude", model="sonnet"),
+            },
+        )
+
+    async def test_import_from_file_path(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import plan from file path reads and validates content."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        plan_file = worktree / "plan.md"
+        plan_content = """# Implementation Plan
+
+**Goal:** Add user authentication
+
+### Task 1: Create auth module
+
+Create the auth module.
+"""
+        plan_file.write_text(plan_content)
+
+        # Target path must be within working directory (security constraint)
+        target_path = worktree / "output" / "plan.md"
+
+        result = await import_external_plan(
+            plan_file=str(plan_file),
+            plan_content=None,
+            target_path=target_path,
+            profile=mock_profile,
+            workflow_id=uuid4(),
+        )
+
+        assert result.goal == "Add user authentication"
+        assert result.plan_markdown == plan_content
+        assert result.total_tasks == 1
+        assert target_path.read_text() == plan_content
+
+    async def test_import_from_inline_content(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import plan from inline content writes and validates."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        plan_content = """# Implementation Plan
+
+**Goal:** Fix bug
+
+### Task 1: Fix the bug
+
+Fix it.
+"""
+        # Target path must be within working directory (security constraint)
+        target_path = worktree / "output" / "plan.md"
+
+        result = await import_external_plan(
+            plan_file=None,
+            plan_content=plan_content,
+            target_path=target_path,
+            profile=mock_profile,
+            workflow_id=uuid4(),
+        )
+
+        assert result.goal == "Fix bug"
+        assert target_path.read_text() == plan_content
+
+    async def test_import_file_not_found_raises(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import with non-existent file raises FileNotFoundError."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Target path must be within working directory (security constraint)
+        target_path = worktree / "output" / "plan.md"
+
+        # Non-existent file within worktree
+        with pytest.raises(FileNotFoundError, match="Plan file not found"):
+            await import_external_plan(
+                plan_file="nonexistent/plan.md",  # Relative to worktree
+                plan_content=None,
+                target_path=target_path,
+                profile=mock_profile,
+                workflow_id=uuid4(),
+            )
+
+    async def test_import_empty_content_raises(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import with empty content raises ValueError."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Target path must be within working directory (security constraint)
+        target_path = worktree / "output" / "plan.md"
+
+        with pytest.raises(ValueError, match="Plan content is empty"):
+            await import_external_plan(
+                plan_file=None,
+                plan_content="   ",
+                target_path=target_path,
+                profile=mock_profile,
+                workflow_id=uuid4(),
+            )
+
+    async def test_import_relative_path_resolved_to_worktree(
+        self, tmp_path: Path
+    ) -> None:
+        """Relative plan_file paths are resolved relative to worktree."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        plan_file = worktree / "docs" / "plan.md"
+        plan_file.parent.mkdir(parents=True)
+        plan_content = "# Plan\n\n**Goal:** Do thing\n\n### Task 1: Do thing\n\nDo it."
+        plan_file.write_text(plan_content)
+
+        profile = Profile(
+            name="test",
+            tracker="noop",
+            repo_root=str(worktree),
+            agents={
+                "plan_validator": AgentConfig(driver="claude", model="sonnet"),
+            },
+        )
+
+        # Target path must be within working directory (security constraint)
+        target_path = worktree / "output" / "plan.md"
+
+        result = await import_external_plan(
+            plan_file="docs/plan.md",
+            plan_content=None,
+            target_path=target_path,
+            profile=profile,
+            workflow_id=uuid4(),
+        )
+
+        assert result.goal == "Do thing"
+
+    async def test_import_regex_extraction(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import uses regex extraction for goal, key_files, and task count."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        plan_content = """# Implementation Plan
+
+**Goal:** Build feature
+
+### Task 1: Create module
+
+Create: `src/feature.py`
+
+Content here.
+"""
+        # Target path must be within working directory (security constraint)
+        target_path = worktree / "output" / "plan.md"
+
+        result = await import_external_plan(
+            plan_file=None,
+            plan_content=plan_content,
+            target_path=target_path,
+            profile=mock_profile,
+            workflow_id=uuid4(),
+        )
+
+        assert result.goal == "Build feature"
+        assert result.plan_markdown == plan_content
+        assert "src/feature.py" in result.key_files
+        assert result.total_tasks == 1
+
+    async def test_import_plan_file_path_traversal_blocked(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import rejects plan_file that resolves outside working directory."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Target path within working directory
+        target_path = worktree / "output" / "plan.md"
+
+        # Attempt path traversal with ..
+        with pytest.raises(ValueError, match="resolves outside working directory"):
+            await import_external_plan(
+                plan_file="../../../etc/passwd",
+                plan_content=None,
+                target_path=target_path,
+                profile=mock_profile,
+                workflow_id=uuid4(),
+            )
+
+    async def test_import_target_path_traversal_blocked(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import rejects target_path that resolves outside working directory."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Attempt path traversal with target_path outside worktree
+        target_path = tmp_path / "outside" / "plan.md"
+
+        with pytest.raises(ValueError, match="resolves outside working directory"):
+            await import_external_plan(
+                plan_file=None,
+                plan_content="# Plan\n\n### Task 1: Do thing",
+                target_path=target_path,
+                profile=mock_profile,
+                workflow_id=uuid4(),
+            )
+
+    async def test_import_absolute_plan_file_outside_worktree_blocked(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import rejects absolute plan_file path outside working directory."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Create plan file outside worktree
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_plan = outside_dir / "plan.md"
+        outside_plan.write_text("# Plan\n\n### Task 1: Do thing")
+
+        # Target path within working directory
+        target_path = worktree / "output" / "plan.md"
+
+        # Attempt to read file outside worktree
+        with pytest.raises(ValueError, match="resolves outside working directory"):
+            await import_external_plan(
+                plan_file=str(outside_plan),
+                plan_content=None,
+                target_path=target_path,
+                profile=mock_profile,
+                workflow_id=uuid4(),
+            )
+
+    async def test_import_skips_write_when_file_at_target(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import skips write when plan_file is already at target location."""
+        import time
+
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Create plan file at the target location
+        plan_content = "# Implementation Plan\n\n### Task 1: Do thing\n\nDo it."
+        target_path = worktree / "docs" / "plans" / "plan.md"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(plan_content)
+
+        # Record modification time
+        original_mtime = target_path.stat().st_mtime
+
+        # Small delay to ensure mtime would change if file is rewritten
+        time.sleep(0.01)
+
+        await import_external_plan(
+            plan_file=str(target_path),
+            plan_content=None,
+            target_path=target_path,
+            profile=mock_profile,
+            workflow_id=uuid4(),
+        )
+
+        # Verify file was NOT rewritten
+        assert target_path.stat().st_mtime == original_mtime
+
+    async def test_import_uses_regex_extraction(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """extract_plan_fields always uses regex (no LLM call)."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        plan_file = worktree / "docs" / "plans" / "my-plan.md"
+        plan_file.parent.mkdir(parents=True)
+        plan_file.write_text("# Build the widget\n\n### Task 1: Do it\n\nDo the thing.\n")
+
+        target_path = worktree / "output" / "plan.md"
+
+        result = await import_external_plan(
+            plan_file=str(plan_file),
+            plan_content=None,
+            target_path=target_path,
+            profile=mock_profile,
+            workflow_id="test-wf-1",
+        )
+
+        # Regex should extract the heading as goal (prefixed with "Implement")
+        assert result.goal == "Implement Build the widget"
+        assert result.total_tasks == 1
+        assert result.plan_markdown is not None
+
+    async def test_import_returns_markdown_when_file_at_target(
+        self, tmp_path: Path, mock_profile: Profile
+    ) -> None:
+        """Import returns plan_markdown even when file is already at target."""
+        from amelia.pipelines.implementation.external_plan import import_external_plan
+
+        # Create worktree directory
+        worktree = Path(mock_profile.repo_root)
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Create plan file at the target location
+        plan_content = "# Implementation Plan\n\n**Goal:** Do thing\n\n### Task 1: Do thing\n\nDo it."
+        target_path = worktree / "docs" / "plans" / "plan.md"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(plan_content)
+
+        result = await import_external_plan(
+            plan_file=str(target_path),
+            plan_content=None,
+            target_path=target_path,
+            profile=mock_profile,
+            workflow_id=uuid4(),
+        )
+
+        # plan_markdown should always be returned (no special handling required by consumers)
+        assert result.plan_markdown == plan_content
+        # plan_path should be set
+        assert result.plan_path == target_path
+        # goal should be extracted from **Goal:** pattern (takes priority over heading)
+        assert result.goal == "Do thing"
+
+    async def test_import_runs_structural_validation(self, mock_profile: Profile, tmp_path: Path) -> None:
+        """Import runs structural validation and includes result."""
+        plan_content = "**Goal:** Add auth\n\n### Task 1: Setup\n\nCreate: `src/auth.py`\n" + ("x" * 200)
+        plan_file = tmp_path / "worktree" / "docs" / "plan.md"
+        plan_file.parent.mkdir(parents=True, exist_ok=True)
+        plan_file.write_text(plan_content)
+        target_path = tmp_path / "worktree" / "docs" / "plans" / "plan.md"
+
+        with patch("amelia.pipelines.implementation.external_plan.extract_plan_fields") as mock_extract:
+            mock_extract.return_value = ExternalPlanImportResult(
+                goal="Add auth",
+                plan_markdown=plan_content,
+                plan_path=target_path,
+                key_files=["src/auth.py"],
+                total_tasks=1,
+            )
+            result = await import_external_plan(
+                plan_file=str(plan_file),
+                plan_content=None,
+                target_path=target_path,
+                profile=mock_profile,
+                workflow_id=uuid4(),
+            )
+        assert result.validation_result is not None
+        assert result.validation_result.valid is True
+
+
+class TestReadPlanContent:
+    """Tests for read_plan_content helper."""
+
+    async def test_read_from_file(self, tmp_path: Path) -> None:
+        plan_file = tmp_path / "plan.md"
+        plan_file.write_text("# My Plan\n\n### Task 1: Do thing")
+        content = await read_plan_content(
+            plan_file=str(plan_file), plan_content=None, working_dir=tmp_path
+        )
+        assert "# My Plan" in content
+
+    async def test_read_from_inline_content(self, tmp_path: Path) -> None:
+        content = await read_plan_content(
+            plan_file=None, plan_content="# Inline Plan", working_dir=tmp_path
+        )
+        assert content == "# Inline Plan"
+
+    async def test_rejects_path_traversal(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="outside working directory"):
+            await read_plan_content(
+                plan_file="/etc/passwd", plan_content=None, working_dir=tmp_path
+            )
+
+    async def test_rejects_empty_content(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            await read_plan_content(
+                plan_file=None, plan_content="   ", working_dir=tmp_path
+            )
+
+
+class TestWritePlanToTarget:
+    """Tests for write_plan_to_target helper."""
+
+    async def test_writes_content_to_target(self, tmp_path: Path) -> None:
+        target = tmp_path / "docs" / "plans" / "plan.md"
+        await write_plan_to_target(
+            content="# Plan", target_path=target, working_dir=tmp_path
+        )
+        assert target.read_text() == "# Plan"
+
+    async def test_creates_parent_dirs(self, tmp_path: Path) -> None:
+        target = tmp_path / "deep" / "nested" / "plan.md"
+        await write_plan_to_target(
+            content="# Plan", target_path=target, working_dir=tmp_path
+        )
+        assert target.exists()
+
+    async def test_skips_write_when_source_equals_target(self, tmp_path: Path) -> None:
+        target = tmp_path / "plan.md"
+        target.write_text("# Original")
+        await write_plan_to_target(
+            content="# Original",
+            target_path=target,
+            working_dir=tmp_path,
+            source_path=target,
+        )
+        assert target.read_text() == "# Original"
+
+
+class TestExtractPlanFields:
+    """Tests for extract_plan_fields (regex-only, no LLM)."""
+
+    def test_extracts_goal_from_heading(self) -> None:
+        """Extract goal from first heading."""
+        content = "# Implement user auth\n\n### Task 1: Setup"
+        result = extract_plan_fields(content)
+        assert "auth" in result.goal.lower() or result.goal == "Implementation plan"
+
+    def test_extracts_goal_from_bold_pattern(self) -> None:
+        """Extract goal from **Goal:** pattern."""
+        content = "**Goal:** Add user authentication\n\n### Task 1: Setup auth"
+        result = extract_plan_fields(content)
+        assert result.goal == "Add user authentication"
+
+    def test_returns_content_as_markdown(self) -> None:
+        """Plan markdown is the content as-is."""
+        content = "# Plan\n\nSome content"
+        result = extract_plan_fields(content)
+        assert result.plan_markdown == content
+
+    def test_extracts_key_files(self) -> None:
+        """Extract key files from Create/Modify patterns."""
+        content = "**Goal:** Test\n\n### Task 1: Files\n\nCreate: `src/auth.py`\nModify: `src/main.py`"
+        result = extract_plan_fields(content)
+        assert "src/auth.py" in result.key_files
+        assert "src/main.py" in result.key_files
+
+    def test_counts_tasks(self) -> None:
+        """Extract task count from ### Task N: headers."""
+        content = "**Goal:** Test\n\n### Task 1: First\n\n### Task 2: Second"
+        result = extract_plan_fields(content)
+        assert result.total_tasks == 2
+
+    def test_extracts_multiline_goal(self) -> None:
+        """Extract goal that spans multiple lines."""
+        content = "**Goal:** Implement user authentication\nwith OAuth2 support\n\n### Task 1: Setup"
+        result = extract_plan_fields(content)
+        assert result.goal == "Implement user authentication with OAuth2 support"
+
+    def test_multiline_goal_stops_at_blank_line(self) -> None:
+        """Multi-line goal stops at blank line."""
+        content = "**Goal:** First line\nsecond line\n\nSome other text"
+        result = extract_plan_fields(content)
+        assert result.goal == "First line second line"
+
+    def test_multiline_goal_stops_at_heading(self) -> None:
+        """Multi-line goal stops at heading."""
+        content = "**Goal:** First line\nsecond line\n# Heading"
+        result = extract_plan_fields(content)
+        assert result.goal == "First line second line"
+
+    def test_multiline_goal_stops_at_bold(self) -> None:
+        """Multi-line goal stops at next bold marker."""
+        content = "**Goal:** First line\nsecond line\n**Key Files:** stuff"
+        result = extract_plan_fields(content)
+        assert result.goal == "First line second line"
+
+    def test_extracts_goal_with_inline_code(self) -> None:
+        """Extract goal that contains inline code blocks."""
+        content = "**Goal:** Add `user_auth` module to `src/auth.py`\n\n### Task 1: Setup"
+        result = extract_plan_fields(content)
+        assert result.goal == "Add `user_auth` module to `src/auth.py`"

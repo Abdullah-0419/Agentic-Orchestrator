@@ -1,0 +1,159 @@
+"""Integration tests for the complete approval flow.
+
+These tests verify the interrupt/resume cycle works end-to-end:
+1. Graph executes until interrupt_before human_approval_node
+2. GraphInterrupt is raised, workflow status becomes "blocked"
+3. User approves via approve_workflow()
+4. Graph resumes with human_approved=True in state
+5. Workflow completes successfully
+"""
+
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
+
+import pytest
+
+from amelia.server.models.events import EventType, WorkflowEvent
+from amelia.server.models.state import ServerExecutionState
+from amelia.server.orchestrator.service import OrchestratorService
+
+
+@pytest.fixture
+def event_tracker():
+    """Create event bus that tracks all emitted events."""
+
+    class EventTracker:
+        def __init__(self):
+            self.events: list[WorkflowEvent] = []
+
+        def emit(self, event: WorkflowEvent) -> None:
+            self.events.append(event)
+
+        def get_by_type(self, event_type: EventType) -> list[WorkflowEvent]:
+            return [e for e in self.events if e.event_type == event_type]
+
+    return EventTracker()
+
+
+class TestMissingRequiredFields:
+    """Test error handling for missing required workflow fields."""
+
+    async def test_missing_profile_id_sets_status_to_failed(
+        self, event_tracker, mock_repository
+    ):
+        """When profile_id is None (and no execution_state), status is set to failed."""
+        service = OrchestratorService(
+            event_tracker,
+            mock_repository,
+            checkpointer=AsyncMock(),
+        )
+
+        # Create state without profile_id
+        server_state = ServerExecutionState(
+            id=uuid4(),
+            issue_id="TEST-ERR",
+            worktree_path="/tmp/test-error",
+            started_at=datetime.now(UTC),
+            profile_id=None,  # Missing - will cause error
+        )
+
+        await mock_repository.create(server_state)
+        await service._run_workflow(server_state.id, server_state)
+
+        # Verify status is "failed"
+        persisted = await mock_repository.get(server_state.id)
+        assert persisted is not None
+        assert persisted.workflow_status == "failed"
+        assert persisted.failure_reason is not None
+        assert "Missing profile_id" in persisted.failure_reason
+
+
+class TestLifecycleEvents:
+    """Test workflow lifecycle event emission."""
+
+    @patch("amelia.server.orchestrator.service.create_implementation_graph")
+    async def test_workflow_started_event_emitted(
+        self,
+        mock_create_graph,
+        event_tracker,
+        mock_repository,
+        mock_profile_repo,
+        langgraph_mock_factory,
+    ):
+        """WORKFLOW_STARTED event is emitted at the start."""
+        # Setup LangGraph mocks using factory
+        mocks = langgraph_mock_factory()
+        mock_create_graph.return_value = mocks.graph
+
+        service = OrchestratorService(
+            event_tracker,
+            mock_repository,
+            profile_repo=mock_profile_repo,
+            checkpointer=AsyncMock(),
+        )
+
+        server_state = ServerExecutionState(
+            id=uuid4(),
+            issue_id="TEST-123",
+            worktree_path="/tmp/test-lifecycle",
+            started_at=datetime.now(UTC),
+            profile_id="test",
+        )
+
+        await mock_repository.create(server_state)
+        await service._run_workflow(server_state.id, server_state)
+
+        # Check WORKFLOW_STARTED was emitted
+        started_events = event_tracker.get_by_type(EventType.WORKFLOW_STARTED)
+        assert len(started_events) == 1
+
+
+class TestGraphInterruptHandling:
+    """Test GraphInterrupt is handled correctly."""
+
+    @patch("amelia.server.orchestrator.service.create_implementation_graph")
+    async def test_interrupt_sets_status_blocked(
+        self,
+        mock_create_graph,
+        event_tracker,
+        mock_repository,
+        mock_profile_repo,
+        langgraph_mock_factory,
+    ):
+        """__interrupt__ chunk sets status to blocked and emits APPROVAL_REQUIRED."""
+        # Setup LangGraph mocks with custom interrupt sequence
+        # Combined stream mode returns (mode, data) tuples
+        interrupt_items = [
+            ("updates", {"architect_node": {}}),  # First node completes
+            ("updates", {"__interrupt__": ("Paused for approval",)}),  # Interrupt signal
+        ]
+        mocks = langgraph_mock_factory(astream_items=interrupt_items)
+        mock_create_graph.return_value = mocks.graph
+
+        service = OrchestratorService(
+            event_tracker,
+            mock_repository,
+            profile_repo=mock_profile_repo,
+            checkpointer=AsyncMock(),
+        )
+
+        server_state = ServerExecutionState(
+            id=uuid4(),
+            issue_id="TEST-456",
+            worktree_path="/tmp/test-interrupt",
+            started_at=datetime.now(UTC),
+            profile_id="test",
+        )
+
+        await mock_repository.create(server_state)
+        await service._run_workflow(server_state.id, server_state)
+
+        # Verify status is blocked
+        persisted = await mock_repository.get(server_state.id)
+        assert persisted is not None
+        assert persisted.workflow_status == "blocked"
+
+        # Verify APPROVAL_REQUIRED was emitted
+        approval_events = event_tracker.get_by_type(EventType.APPROVAL_REQUIRED)
+        assert len(approval_events) == 1

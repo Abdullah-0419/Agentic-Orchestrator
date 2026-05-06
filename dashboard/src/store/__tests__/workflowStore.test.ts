@@ -1,0 +1,402 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { useWorkflowStore, resetBatchState } from '../workflowStore';
+import { createMockEvent } from '../../__tests__/fixtures';
+
+// Mock sessionStorage
+const sessionStorageMock = (() => {
+  let store: Record<string, string> = {};
+  return {
+    getItem: (key: string) => store[key] || null,
+    setItem: (key: string, value: string) => {
+      store[key] = value;
+    },
+    removeItem: (key: string) => {
+      delete store[key];
+    },
+    clear: () => {
+      store = {};
+    },
+  };
+})();
+
+Object.defineProperty(window, 'sessionStorage', { value: sessionStorageMock });
+
+describe('workflowStore', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetBatchState();
+    useWorkflowStore.setState({
+      eventsByWorkflow: {},
+      eventIdsByWorkflow: {},
+      lastEventTimestampByWorkflow: {},
+      lastEventId: null,
+      isConnected: false,
+      connectionError: null,
+      pendingActions: [],
+    });
+    sessionStorageMock.clear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * Helper function to flush batched events.
+   * Should be called after addEvent() to ensure events are applied to state.
+   */
+  function flushEvents(): void {
+    vi.advanceTimersByTime(100);
+  }
+
+  describe('addEvent', () => {
+    it('should add event to workflow event list', () => {
+      const event = createMockEvent({
+        id: 'evt-1',
+        workflow_id: 'wf-1',
+        message: 'Workflow started',
+      });
+
+      useWorkflowStore.getState().addEvent(event);
+      flushEvents();
+
+      const state = useWorkflowStore.getState();
+      expect(state.eventsByWorkflow['wf-1']).toHaveLength(1);
+      expect(state.eventsByWorkflow['wf-1']![0]).toEqual(event);
+      expect(state.lastEventId).toBe('evt-1');
+    });
+
+    it('should append to existing events', () => {
+      const event1 = createMockEvent({
+        id: 'evt-1',
+        workflow_id: 'wf-1',
+        sequence: 1,
+        message: 'Started',
+      });
+
+      const event2 = createMockEvent({
+        id: 'evt-2',
+        workflow_id: 'wf-1',
+        sequence: 2,
+        event_type: 'stage_started',
+        message: 'Planning',
+        data: { stage: 'architect' },
+      });
+
+      useWorkflowStore.getState().addEvent(event1);
+      useWorkflowStore.getState().addEvent(event2);
+      flushEvents();
+
+      const events = useWorkflowStore.getState().eventsByWorkflow['wf-1'];
+      expect(events).toHaveLength(2);
+      expect(events![0]!.id).toBe('evt-1');
+      expect(events![1]!.id).toBe('evt-2');
+    });
+
+    it('should deduplicate events by ID (handles StrictMode double-effect)', () => {
+      const event = createMockEvent({
+        id: 'evt-duplicate',
+        workflow_id: 'wf-1',
+        sequence: 1,
+        message: 'Starting architect_node',
+      });
+
+      // Simulate StrictMode causing duplicate event additions
+      useWorkflowStore.getState().addEvent(event);
+      useWorkflowStore.getState().addEvent(event); // Same event added again
+      flushEvents();
+
+      const events = useWorkflowStore.getState().eventsByWorkflow['wf-1'];
+      expect(events).toHaveLength(1);
+      expect(events![0]!.id).toBe('evt-duplicate');
+    });
+
+    // Verify that adding a duplicate of an EARLIER event doesn't
+    // revert lastEventId to the older event's ID
+    it('should not update lastEventId when duplicate is skipped', () => {
+      const event1 = createMockEvent({
+        id: 'evt-1',
+        workflow_id: 'wf-1',
+        sequence: 1,
+        message: 'First event',
+      });
+
+      const event2 = createMockEvent({
+        id: 'evt-2',
+        workflow_id: 'wf-1',
+        sequence: 2,
+        message: 'Second event',
+      });
+
+      useWorkflowStore.getState().addEvent(event1);
+      useWorkflowStore.getState().addEvent(event2);
+      flushEvents();
+
+      // Try to add duplicate of first event
+      useWorkflowStore.getState().addEvent(event1);
+      flushEvents();
+
+      // lastEventId should remain evt-2, not revert to evt-1
+      expect(useWorkflowStore.getState().lastEventId).toBe('evt-2');
+
+      // Verify no duplicate was added
+      const events = useWorkflowStore.getState().eventsByWorkflow['wf-1'];
+      expect(events).toHaveLength(2);
+    });
+
+    it('should dedupe events with same id from different objects', () => {
+      const event1 = createMockEvent({
+        id: 'evt-dedupe',
+        workflow_id: 'wf-1',
+        sequence: 1,
+        message: 'Original event',
+      });
+
+      // Create distinct object with same id (simulates JSON deserialization)
+      const event2 = { ...event1, message: 'Cloned event' };
+
+      // Verify they are different object references
+      expect(event1).not.toBe(event2);
+      expect(event1.id).toBe(event2.id);
+
+      useWorkflowStore.getState().addEvent(event1);
+      useWorkflowStore.getState().addEvent(event2);
+      flushEvents();
+
+      // Should deduplicate by id, not object reference
+      const events = useWorkflowStore.getState().eventsByWorkflow['wf-1'];
+      expect(events).toHaveLength(1);
+      expect(events![0]!.message).toBe('Original event');
+    });
+
+    it('should allow same event ID across different workflows', () => {
+      const event1 = createMockEvent({
+        id: 'evt-shared',
+        workflow_id: 'wf-1',
+        sequence: 1,
+        message: 'Event in workflow 1',
+      });
+      const event2 = createMockEvent({
+        id: 'evt-shared',
+        workflow_id: 'wf-2',
+        sequence: 1,
+        message: 'Event in workflow 2',
+      });
+
+      useWorkflowStore.getState().addEvent(event1);
+      useWorkflowStore.getState().addEvent(event2);
+      flushEvents();
+
+      expect(useWorkflowStore.getState().eventsByWorkflow['wf-1']).toHaveLength(1);
+      expect(useWorkflowStore.getState().eventsByWorkflow['wf-2']).toHaveLength(1);
+    });
+
+    it('should trim events when exceeding MAX_EVENTS_PER_WORKFLOW', () => {
+      const MAX_EVENTS = 500;
+
+      // Add 501 events - this exceeds the batch limit of 50, so will trigger multiple flushes
+      for (let i = 1; i <= MAX_EVENTS + 1; i++) {
+        const event = createMockEvent({
+          id: `evt-${i}`,
+          workflow_id: 'wf-1',
+          sequence: i,
+          event_type: 'stage_started',
+          message: `Event ${i}`,
+        });
+        useWorkflowStore.getState().addEvent(event);
+      }
+      flushEvents();
+
+      const events = useWorkflowStore.getState().eventsByWorkflow['wf-1'];
+      expect(events).toHaveLength(MAX_EVENTS);
+      // Should keep most recent (evt-2 to evt-501, dropping evt-1)
+      expect(events![0]!.id).toBe('evt-2');
+      expect(events![MAX_EVENTS - 1]!.id).toBe(`evt-${MAX_EVENTS + 1}`);
+    });
+  });
+
+  describe('connection state', () => {
+    it('should update connection status', () => {
+      useWorkflowStore.getState().setConnected(true);
+
+      expect(useWorkflowStore.getState().isConnected).toBe(true);
+      expect(useWorkflowStore.getState().connectionError).toBeNull();
+    });
+
+    it('should set error when disconnected', () => {
+      useWorkflowStore.getState().setConnected(false, 'Connection lost');
+
+      expect(useWorkflowStore.getState().isConnected).toBe(false);
+      expect(useWorkflowStore.getState().connectionError).toBe('Connection lost');
+    });
+  });
+
+  describe('pending actions', () => {
+    it('should add pending action', () => {
+      useWorkflowStore.getState().addPendingAction('approve-wf-1');
+
+      expect(useWorkflowStore.getState().pendingActions.includes('approve-wf-1')).toBe(true);
+    });
+
+    it('should not duplicate pending action', () => {
+      useWorkflowStore.getState().addPendingAction('approve-wf-1');
+      useWorkflowStore.getState().addPendingAction('approve-wf-1');
+
+      expect(useWorkflowStore.getState().pendingActions.length).toBe(1);
+    });
+
+    it('should remove pending action', () => {
+      useWorkflowStore.getState().addPendingAction('approve-wf-1');
+      useWorkflowStore.getState().removePendingAction('approve-wf-1');
+
+      expect(useWorkflowStore.getState().pendingActions.length).toBe(0);
+    });
+  });
+
+  describe('persistence', () => {
+    it('should persist lastEventId but NOT events', () => {
+      // Add an event to update lastEventId
+      useWorkflowStore.getState().addEvent(
+        createMockEvent({
+          id: 'evt-999',
+          workflow_id: 'wf-1',
+          message: 'Started',
+        })
+      );
+      flushEvents();
+
+      const stored = sessionStorageMock.getItem('amelia-workflow-state');
+      expect(stored).not.toBeNull();
+      const parsed = JSON.parse(stored!);
+
+      // Should persist lastEventId
+      expect(parsed.state.lastEventId).toBe('evt-999');
+
+      // Should NOT persist events
+      expect(parsed.state.eventsByWorkflow).toBeUndefined();
+    });
+  });
+
+  describe('batched event processing', () => {
+    it('should batch multiple events into single state update', () => {
+      const store = useWorkflowStore.getState();
+
+      // Add 40 events rapidly (less than batch limit of 50, so no immediate flush)
+      for (let i = 0; i < 40; i++) {
+        store.addEvent({
+          id: `evt-${i}`,
+          workflow_id: 'wf-1',
+          sequence: i,
+          timestamp: '2026-01-08T10:00:00Z',
+          agent: 'system',
+          event_type: 'stage_started',
+          level: 'info',
+          message: `Event ${i}`,
+        });
+      }
+
+      // Before flush, events should NOT be in state yet (batching defers updates)
+      const stateBeforeFlush = useWorkflowStore.getState();
+      expect(stateBeforeFlush.eventsByWorkflow['wf-1'] ?? []).toHaveLength(0);
+
+      // Flush the batch
+      vi.advanceTimersByTime(100);
+
+      // After flush, all events should be in store
+      const stateAfterFlush = useWorkflowStore.getState();
+      expect(stateAfterFlush.eventsByWorkflow['wf-1']).toHaveLength(40);
+    });
+
+    it('should flush batch immediately when reaching batch size limit', () => {
+      const store = useWorkflowStore.getState();
+
+      // Add events up to batch limit (50)
+      for (let i = 0; i < 50; i++) {
+        store.addEvent({
+          id: `evt-${i}`,
+          workflow_id: 'wf-1',
+          sequence: i,
+          timestamp: '2026-01-08T10:00:00Z',
+          agent: 'system',
+          event_type: 'stage_started',
+          level: 'info',
+          message: `Event ${i}`,
+        });
+      }
+
+      // Should flush immediately without waiting for timer
+      const state = useWorkflowStore.getState();
+      expect(state.eventsByWorkflow['wf-1']).toHaveLength(50);
+    });
+  });
+
+  describe('workflow eviction', () => {
+    it('should evict oldest workflows when exceeding MAX_WORKFLOWS', () => {
+      const MAX_WORKFLOWS = 100;
+      const store = useWorkflowStore.getState();
+
+      // Add events for 101 workflows with increasing timestamps
+      // Using ISO format that sorts correctly: 2026-01-01T00:00:00Z, etc.
+      for (let i = 0; i <= MAX_WORKFLOWS; i++) {
+        // Generate unique, sortable timestamps
+        const day = String(Math.floor(i / 24) + 1).padStart(2, '0');
+        const hour = String(i % 24).padStart(2, '0');
+        store.addEvent({
+          id: `evt-wf-${i}`,
+          workflow_id: `wf-${i}`,
+          sequence: 1,
+          timestamp: `2026-01-${day}T${hour}:00:00Z`,
+          agent: 'system',
+          event_type: 'stage_started',
+          level: 'info',
+          message: `Workflow ${i} started`,
+        });
+      }
+      flushEvents();
+
+      const state = useWorkflowStore.getState();
+      const workflowIds = Object.keys(state.eventsByWorkflow);
+
+      // Should have evicted the oldest workflow (wf-0)
+      expect(workflowIds).toHaveLength(MAX_WORKFLOWS);
+      expect(workflowIds).not.toContain('wf-0');
+      expect(workflowIds).toContain('wf-1');
+      expect(workflowIds).toContain(`wf-${MAX_WORKFLOWS}`);
+
+      // Timestamp tracking should also be cleaned up
+      expect(state.lastEventTimestampByWorkflow['wf-0']).toBeUndefined();
+      expect(state.eventIdsByWorkflow['wf-0']).toBeUndefined();
+    });
+
+    it('should track last event timestamp per workflow', () => {
+      const store = useWorkflowStore.getState();
+
+      store.addEvent({
+        id: 'evt-1',
+        workflow_id: 'wf-1',
+        sequence: 1,
+        timestamp: '2026-01-01T10:00:00Z',
+        agent: 'system',
+        event_type: 'stage_started',
+        level: 'info',
+        message: 'First event',
+      });
+
+      store.addEvent({
+        id: 'evt-2',
+        workflow_id: 'wf-1',
+        sequence: 2,
+        timestamp: '2026-01-01T11:00:00Z',
+        agent: 'system',
+        event_type: 'stage_started',
+        level: 'info',
+        message: 'Second event',
+      });
+      flushEvents();
+
+      const state = useWorkflowStore.getState();
+      // Should have the latest timestamp
+      expect(state.lastEventTimestampByWorkflow['wf-1']).toBe('2026-01-01T11:00:00Z');
+    });
+  });
+});

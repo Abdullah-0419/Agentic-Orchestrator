@@ -1,0 +1,265 @@
+"""Unit tests for replan_workflow orchestrator method."""
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+
+from amelia.core.types import AgentConfig, Profile
+from amelia.pipelines.implementation.state import rebuild_implementation_state
+from amelia.server.events.bus import EventBus
+from amelia.server.exceptions import InvalidStateError, WorkflowConflictError, WorkflowNotFoundError
+from amelia.server.models.events import EventType
+from amelia.server.models.state import PlanCache, ServerExecutionState, WorkflowStatus
+from amelia.server.orchestrator.service import OrchestratorService
+
+
+# Rebuild Pydantic models so forward references resolve correctly
+rebuild_implementation_state()
+
+
+@pytest.fixture
+def mock_event_bus() -> EventBus:
+    """Create event bus for testing."""
+    return EventBus()
+
+
+@pytest.fixture
+def mock_repository() -> AsyncMock:
+    """Create mock repository."""
+    repo = AsyncMock()
+    repo.create = AsyncMock()
+    repo.update = AsyncMock()
+    repo.set_status = AsyncMock()
+    repo.update_plan_cache = AsyncMock()
+    repo.save_event = AsyncMock()
+    repo.get_max_event_sequence = AsyncMock(return_value=0)
+    repo.get = AsyncMock(return_value=None)
+    return repo
+
+
+@pytest.fixture
+def mock_profile_repo() -> AsyncMock:
+    """Create mock profile repository."""
+    repo = AsyncMock()
+    agent_config = AgentConfig(driver="claude", model="sonnet")
+    default_profile = Profile(
+        name="test",
+        tracker="noop",
+        # repo_root is overwritten by _update_profile_repo_root in replan_workflow
+        repo_root="/tmp/test-repo",
+        agents={
+            "architect": agent_config,
+            "developer": agent_config,
+            "reviewer": agent_config,
+            "task_reviewer": agent_config,
+            "evaluator": agent_config,
+            "plan_validator": agent_config,
+        },
+    )
+    repo.get_profile.return_value = default_profile
+    repo.get_active_profile.return_value = default_profile
+    return repo
+
+
+@pytest.fixture
+def orchestrator(
+    mock_event_bus: EventBus,
+    mock_repository: AsyncMock,
+    mock_profile_repo: AsyncMock,
+) -> OrchestratorService:
+    """Create orchestrator service."""
+    return OrchestratorService(
+        event_bus=mock_event_bus,
+        repository=mock_repository,
+        profile_repo=mock_profile_repo,
+        max_concurrent=5,
+    )
+
+
+def make_blocked_workflow(
+    issue_id: str = "ISSUE-REPLAN",
+) -> ServerExecutionState:
+    """Create a blocked workflow with a plan ready for replan testing."""
+    return ServerExecutionState(
+        id=uuid4(),
+        issue_id=issue_id,
+        worktree_path="/tmp/test-repo",
+        workflow_status=WorkflowStatus.BLOCKED,
+        profile_id="test",
+        plan_cache=PlanCache(
+            goal="Original goal",
+            plan_markdown="# Original plan",
+            plan_path=None,
+            total_tasks=3,
+        ),
+    )
+
+
+class TestDeleteCheckpoint:
+    """Tests for _delete_checkpoint helper."""
+
+    async def test_delete_checkpoint_removes_data(
+        self,
+        orchestrator: OrchestratorService,
+    ) -> None:
+        """_delete_checkpoint should call adelete_thread on the checkpointer."""
+        mock_checkpointer = AsyncMock()
+        orchestrator._checkpointer = mock_checkpointer
+
+        await orchestrator._delete_checkpoint("wf-123")
+
+        # Should have called adelete_thread with the workflow ID
+        mock_checkpointer.adelete_thread.assert_awaited_once_with("wf-123")
+
+    async def test_delete_checkpoint_no_checkpointer(
+        self,
+        orchestrator: OrchestratorService,
+    ) -> None:
+        """_delete_checkpoint should return early if no checkpointer is set."""
+        orchestrator._checkpointer = None
+
+        # Should not raise
+        await orchestrator._delete_checkpoint("wf-123")
+
+
+class TestReplanWorkflow:
+    """Tests for replan_workflow method."""
+
+    async def test_replan_happy_path(
+        self,
+        orchestrator: OrchestratorService,
+        mock_repository: AsyncMock,
+    ) -> None:
+        """replan_workflow should clear plan_cache, delete checkpoint, and spawn planning task."""
+        workflow = make_blocked_workflow()
+        wf_id = workflow.id
+        mock_repository.get.return_value = workflow
+
+        with (
+            patch.object(orchestrator, "_delete_checkpoint", new_callable=AsyncMock) as mock_delete,
+            patch.object(orchestrator, "_run_planning_task", new_callable=AsyncMock),
+        ):
+            await orchestrator.replan_workflow(wf_id)
+
+        # Should have deleted checkpoint
+        mock_delete.assert_awaited_once_with(wf_id)
+
+        # Should have cleared plan_cache
+        mock_repository.update_plan_cache.assert_awaited_once()
+        call_args = mock_repository.update_plan_cache.call_args
+        assert call_args[0][0] == wf_id
+        cleared_cache = call_args[0][1]
+        assert isinstance(cleared_cache, PlanCache)
+        assert cleared_cache.goal is None
+        assert cleared_cache.plan_markdown is None
+
+        # Should have set status to PENDING
+        mock_repository.set_status.assert_awaited_once_with(wf_id, WorkflowStatus.PENDING)
+
+    async def test_replan_wrong_status_raises(
+        self,
+        orchestrator: OrchestratorService,
+        mock_repository: AsyncMock,
+    ) -> None:
+        """replan_workflow should reject non-blocked workflows."""
+        workflow = make_blocked_workflow()
+        workflow.workflow_status = WorkflowStatus.IN_PROGRESS
+        mock_repository.get.return_value = workflow
+
+        with pytest.raises(InvalidStateError, match="blocked"):
+            await orchestrator.replan_workflow(workflow.id)
+
+    async def test_replan_not_found_raises(
+        self,
+        orchestrator: OrchestratorService,
+        mock_repository: AsyncMock,
+    ) -> None:
+        """replan_workflow should raise for missing workflow."""
+        mock_repository.get.return_value = None
+
+        with pytest.raises(WorkflowNotFoundError):
+            await orchestrator.replan_workflow("nonexistent")
+
+    async def test_replan_conflict_when_planning_running(
+        self,
+        orchestrator: OrchestratorService,
+        mock_repository: AsyncMock,
+    ) -> None:
+        """replan_workflow should raise conflict if planning task already active."""
+        workflow = make_blocked_workflow()
+        wf_id = workflow.id
+        mock_repository.get.return_value = workflow
+
+        # Simulate an active planning task
+        orchestrator._planning_tasks[wf_id] = MagicMock(spec=asyncio.Task)
+
+        with pytest.raises(WorkflowConflictError, match="already running"):
+            await orchestrator.replan_workflow(wf_id)
+
+    async def test_replan_emits_event(
+        self,
+        orchestrator: OrchestratorService,
+        mock_repository: AsyncMock,
+        mock_event_bus: EventBus,
+    ) -> None:
+        """replan_workflow should emit a stage_started event."""
+        workflow = make_blocked_workflow()
+        mock_repository.get.return_value = workflow
+
+        received_events = []
+        mock_event_bus.subscribe(lambda e: received_events.append(e))
+
+        with (
+            patch.object(orchestrator, "_delete_checkpoint", new_callable=AsyncMock),
+            patch.object(orchestrator, "_run_planning_task", new_callable=AsyncMock),
+        ):
+            await orchestrator.replan_workflow(workflow.id)
+
+        # Should have emitted replanning event
+        stage_events = [e for e in received_events if e.event_type == EventType.STAGE_STARTED]
+        assert len(stage_events) >= 1
+        assert any("replan" in (e.message or "").lower() for e in stage_events)
+
+    async def test_replan_missing_profile_raises_without_failing_workflow(
+        self,
+        orchestrator: OrchestratorService,
+        mock_repository: AsyncMock,
+        mock_profile_repo: AsyncMock,
+    ) -> None:
+        """replan_workflow should raise ValueError for missing profile without setting FAILED."""
+        workflow = make_blocked_workflow()
+        mock_repository.get.return_value = workflow
+        mock_profile_repo.get_profile.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            await orchestrator.replan_workflow(workflow.id)
+
+        # Workflow should NOT be set to FAILED — the user should be able to
+        # fix the profile and retry since the workflow is still BLOCKED.
+        mock_repository.set_status.assert_not_called()
+
+    async def test_cancel_terminates_planning_task(
+        self,
+        orchestrator: OrchestratorService,
+        mock_repository: AsyncMock,
+    ) -> None:
+        """cancel_workflow should cancel an active planning task."""
+        workflow = make_blocked_workflow()
+        wf_id = workflow.id
+        # Set to PENDING (as if planning is in progress)
+        workflow.workflow_status = WorkflowStatus.PENDING
+        mock_repository.get.return_value = workflow
+
+        # Simulate an active planning task
+        mock_task = MagicMock(spec=asyncio.Task)
+        orchestrator._planning_tasks[wf_id] = mock_task
+
+        await orchestrator.cancel_workflow(wf_id)
+
+        # Planning task should have been cancelled
+        mock_task.cancel.assert_called_once()
+        # Status should be set to cancelled
+        mock_repository.set_status.assert_awaited_once_with(
+            wf_id, WorkflowStatus.CANCELLED
+        )

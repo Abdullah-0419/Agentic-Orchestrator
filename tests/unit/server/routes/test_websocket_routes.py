@@ -1,0 +1,147 @@
+"""Tests for WebSocket endpoint."""
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
+
+import pytest
+from fastapi import WebSocket, WebSocketDisconnect
+
+from amelia.server.events.connection_manager import ConnectionManager
+from amelia.server.models.events import EventType, WorkflowEvent
+from amelia.server.routes.websocket import websocket_endpoint
+
+
+class TestWebSocketEndpoint:
+    """Tests for /ws/events endpoint."""
+
+    @pytest.fixture
+    def mock_repository(self):
+        """Mock WorkflowRepository."""
+        repo = AsyncMock()
+        repo.get_events_after.return_value = []
+        return repo
+
+    @pytest.fixture
+    def mock_connection_manager(self, mock_repository):
+        """Mock ConnectionManager with repository."""
+        manager = AsyncMock(spec=ConnectionManager)
+        manager.get_repository.return_value = mock_repository
+        return manager
+
+    @pytest.fixture
+    def mock_websocket(self):
+        """Mock WebSocket."""
+        return AsyncMock(spec=WebSocket)
+
+    @pytest.mark.parametrize(
+        "message,expected_method,expected_arg",
+        [
+            ({"type": "subscribe", "workflow_id": "wf-123"}, "subscribe", "wf-123"),
+            ({"type": "unsubscribe", "workflow_id": "wf-456"}, "unsubscribe", "wf-456"),
+            ({"type": "subscribe_all"}, "subscribe_all", None),
+        ],
+        ids=["subscribe", "unsubscribe", "subscribe_all"],
+    )
+    async def test_websocket_handles_client_messages(
+        self, mock_connection_manager, mock_repository, mock_websocket, message, expected_method, expected_arg
+    ) -> None:
+        """WebSocket routes client messages to connection manager."""
+        mock_websocket.receive_json.side_effect = [message, WebSocketDisconnect()]
+
+        with patch("amelia.server.routes.websocket.connection_manager", mock_connection_manager):
+            await websocket_endpoint(mock_websocket, None)
+
+        method = getattr(mock_connection_manager, expected_method)
+        if expected_arg:
+            method.assert_awaited_once_with(mock_websocket, expected_arg)
+        else:
+            method.assert_awaited_once_with(mock_websocket)
+
+    async def test_websocket_backfill_when_since_provided(self, mock_connection_manager, mock_repository, mock_websocket) -> None:
+        """WebSocket performs backfill when ?since= parameter provided."""
+        # Mock backfill events
+        backfill_events = [
+            WorkflowEvent(
+                id=uuid4(),
+                workflow_id=uuid4(),
+                sequence=2,
+                timestamp=datetime.now(UTC),
+                agent="system",
+                event_type=EventType.STAGE_STARTED,
+                message="Event 2",
+            ),
+            WorkflowEvent(
+                id=uuid4(),
+                workflow_id=uuid4(),
+                sequence=3,
+                timestamp=datetime.now(UTC),
+                agent="system",
+                event_type=EventType.STAGE_COMPLETED,
+                message="Event 3",
+            ),
+        ]
+
+        mock_repository.get_events_after.return_value = backfill_events
+
+        mock_websocket.receive_json.side_effect = Exception("disconnect")
+
+        since_id = uuid4()
+        with patch("amelia.server.routes.websocket.connection_manager", mock_connection_manager):
+            await websocket_endpoint(mock_websocket, since=str(since_id))
+
+        # Should get events after since_id with limit
+        mock_repository.get_events_after.assert_awaited_once_with(since_id, limit=1000)
+
+        # Should send backfilled events
+        assert mock_websocket.send_json.call_count >= 2
+
+        # Should send backfill_complete
+        backfill_complete_sent = any(
+            call[0][0].get("type") == "backfill_complete"
+            for call in mock_websocket.send_json.call_args_list
+        )
+        assert backfill_complete_sent
+
+    async def test_websocket_sends_backfill_expired_when_event_missing(self, mock_connection_manager, mock_repository, mock_websocket) -> None:
+        """WebSocket sends backfill_expired when requested event doesn't exist."""
+        # Simulate event not found - get_events_after raises ValueError
+        mock_repository.get_events_after.side_effect = ValueError("Event evt-nonexistent not found")
+        mock_websocket.receive_json.side_effect = Exception("disconnect")
+
+        with patch("amelia.server.routes.websocket.connection_manager", mock_connection_manager):
+            await websocket_endpoint(mock_websocket, since=str(uuid4()))
+
+        # Should send backfill_expired message
+        backfill_expired_sent = any(
+            call[0][0].get("type") == "backfill_expired"
+            for call in mock_websocket.send_json.call_args_list
+        )
+        assert backfill_expired_sent
+
+    async def test_websocket_backfill_requests_limit(
+        self, mock_connection_manager, mock_repository, mock_websocket
+    ) -> None:
+        """WebSocket backfill should request a limit to prevent memory exhaustion."""
+        # Create 1500 mock events (exceeds 1000 limit)
+        many_events = [
+            WorkflowEvent(
+                id=uuid4(),
+                workflow_id=uuid4(),
+                sequence=i,
+                timestamp=datetime.now(UTC),
+                agent="system",
+                event_type=EventType.CLAUDE_TOOL_CALL,
+                message=f"Event {i}",
+            )
+            for i in range(2, 1502)
+        ]
+        mock_repository.get_events_after.return_value = many_events
+
+        mock_websocket.receive_json.side_effect = Exception("disconnect")
+
+        since_id = uuid4()
+        with patch("amelia.server.routes.websocket.connection_manager", mock_connection_manager):
+            await websocket_endpoint(mock_websocket, since=str(since_id))
+
+        # Should request with limit
+        mock_repository.get_events_after.assert_awaited_once_with(since_id, limit=1000)

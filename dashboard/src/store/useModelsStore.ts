@@ -1,0 +1,238 @@
+import { create } from 'zustand';
+import type { ModelInfo } from '@/components/model-picker/types';
+import { AGENT_MODEL_REQUIREMENTS, MODELS_API_URL } from '@/components/model-picker/constants';
+import { flattenModelsData, filterModelsByRequirements, upsertModelInfo } from '@/lib/models-utils';
+import { logger } from '@/lib/logger';
+import { API_BASE_URL, createTimeoutSignal } from '@/api/utils';
+
+/**
+ * Custom error class for fetch timeout events.
+ */
+class TimeoutError extends Error {
+  constructor(message: string = 'timeout') {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+
+/**
+ * State for the models store.
+ */
+interface ModelsState {
+  /** Flattened list of all models from OpenRouter */
+  models: ModelInfo[];
+  /** Unique list of provider IDs */
+  providers: string[];
+  /** Whether a fetch is in progress */
+  isLoading: boolean;
+  /** Error message from last fetch attempt */
+  error: string | null;
+  /** Timestamp of last successful fetch */
+  lastFetched: number | null;
+  /** AbortController for the current fetch */
+  abortController: AbortController | null;
+  /** Timeout ID for the current fetch timeout */
+  timeoutId?: ReturnType<typeof setTimeout>;
+
+  /** Fetch models from OpenRouter API (skips if already loaded) */
+  fetchModels: () => Promise<void>;
+  /** Force refresh models even if already loaded */
+  refreshModels: () => Promise<void>;
+  /** Look up a single model by ID via the backend and merge it into the store */
+  lookupModelById: (modelId: string) => Promise<ModelInfo>;
+  /** Get models filtered by agent requirements */
+  getModelsForAgent: (agentKey: string) => ModelInfo[];
+}
+
+function encodeModelPath(modelId: string): string {
+  return modelId
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
+/**
+ * Zustand store for OpenRouter model data.
+ *
+ * Note: This store does not implement subscribe cleanup for pending requests/timeouts
+ * because Zustand stores persist for the app lifetime. Cleanup is handled within
+ * refreshModels() when a new request starts (lines 66-74) and in success/error paths.
+ * If the store is ever scoped to component lifetime, add cleanup via store.destroy().
+ */
+export const useModelsStore = create<ModelsState>((set, get) => ({
+  models: [],
+  providers: [],
+  isLoading: false,
+  error: null,
+  lastFetched: null,
+  abortController: null,
+  timeoutId: undefined,
+
+  fetchModels: async () => {
+    // Skip if already fetched this session
+    if (get().models.length > 0 && get().lastFetched) {
+      return;
+    }
+
+    await get().refreshModels();
+  },
+
+  refreshModels: async () => {
+    // Cancel any pending request
+    const currentController = get().abortController;
+    const currentTimeoutId = get().timeoutId;
+    if (currentController) {
+      currentController.abort();
+    }
+    if (currentTimeoutId !== undefined) {
+      clearTimeout(currentTimeoutId);
+    }
+
+    // Create new AbortController for this request
+    const abortController = new AbortController();
+
+    // Set timeout to abort request after 30 seconds
+    const timeoutId = setTimeout(() => {
+      abortController.abort(new TimeoutError());
+    }, 30000);
+
+    set({ isLoading: true, error: null, abortController, timeoutId });
+
+    try {
+      const response = await fetch(MODELS_API_URL, { signal: abortController.signal });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      let data;
+      try {
+        data = await response.json();
+      } catch (parseError) {
+        throw new Error(`Invalid JSON response from models API: ${parseError}`);
+      }
+
+      if (!data || !data.data || !Array.isArray(data.data)) {
+        throw new Error('Invalid response shape from models API');
+      }
+
+      const models = flattenModelsData(data.data);
+      const providers = [...new Set(models.map((m) => m.provider))];
+
+      set({
+        models,
+        providers,
+        isLoading: false,
+        lastFetched: Date.now(),
+        abortController: null,
+        timeoutId: undefined,
+      });
+    } catch (err) {
+      // Don't update state if a newer request has already started
+      if (get().abortController !== abortController) {
+        return;
+      }
+
+      const timedOut =
+        err instanceof TimeoutError || abortController.signal.reason instanceof TimeoutError;
+
+      if (timedOut || (err instanceof Error && err.name === 'AbortError')) {
+        set({
+          error: timedOut ? 'Request timed out after 30 seconds. Check your connection.' : null,
+          isLoading: false,
+          abortController: null,
+          timeoutId: undefined,
+        });
+        return;
+      }
+
+      logger.error('Failed to fetch models', err, {
+        url: MODELS_API_URL,
+        timestamp: Date.now(),
+      });
+      set({
+        error: 'Failed to load models. Check your connection.',
+        isLoading: false,
+        abortController: null,
+        timeoutId: undefined,
+      });
+    } finally {
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+      }
+    }
+  },
+
+  lookupModelById: async (modelId: string) => {
+    const trimmedModelId = modelId.trim();
+    const response = await fetch(`${API_BASE_URL}/models/${encodeModelPath(trimmedModelId)}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      signal: createTimeoutSignal(),
+    });
+
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch (parseError) {
+      throw new Error(`Invalid JSON response from model lookup API: ${parseError}`);
+    }
+
+    if (!response.ok) {
+      const detail =
+        typeof data === 'object' &&
+        data !== null &&
+        'detail' in data &&
+        typeof data.detail === 'string'
+          ? data.detail
+          : `HTTP ${response.status}`;
+      throw new Error(detail);
+    }
+
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      !('id' in data) ||
+      typeof data.id !== 'string' ||
+      !('name' in data) ||
+      typeof data.name !== 'string' ||
+      !('provider' in data) ||
+      typeof data.provider !== 'string' ||
+      !('capabilities' in data) ||
+      data.capabilities === null ||
+      typeof data.capabilities !== 'object' ||
+      !('limit' in data) ||
+      data.limit === null ||
+      typeof data.limit !== 'object' ||
+      !('cost' in data) ||
+      data.cost === null ||
+      typeof data.cost !== 'object'
+    ) {
+      throw new Error('Invalid response shape from model lookup API');
+    }
+
+    const model = data as ModelInfo;
+    set((state) => {
+      const models = upsertModelInfo(state.models, model);
+      const providers = [...new Set(models.map((entry) => entry.provider))];
+
+      return {
+        models,
+        providers,
+      };
+    });
+
+    return model;
+  },
+
+  getModelsForAgent: (agentKey: string) => {
+    const { models } = get();
+    const requirements = AGENT_MODEL_REQUIREMENTS[agentKey];
+
+    if (!requirements) {
+      // Unknown agent - return all models with tool_call
+      return models;
+    }
+
+    return filterModelsByRequirements(models, requirements);
+  },
+}));

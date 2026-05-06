@@ -1,0 +1,574 @@
+# Changelog
+
+All notable changes to Amelia will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.20.1] - 2026-05-02
+
+### Changed
+
+- **deps:** Bump deepagents 0.4.3 → 0.5.6 with langchain stack pulled forward (anthropic 0.78→0.97, langchain 1.2.10→1.2.17, langchain-anthropic 1.3.3→1.4.2, langgraph 1.0.10rc1→1.1.10, langsmith 0.7.31→0.8.0) ([#582](https://github.com/existential-birds/amelia/pull/582))
+- **deps:** Bump deepagents to 0.5.x; LocalSandbox callers must pass `virtual_mode=False` explicitly to keep the unrestricted path ([#582](https://github.com/existential-birds/amelia/pull/582))
+- **deps:** Bump langchain-openai 1.1.9 → 1.1.14, python-multipart 0.0.22 → 0.0.26, langchain-core 1.2.22 → 1.2.28, lxml 6.0.2 → 6.1.0, python-dotenv 1.2.1 → 1.2.2, pillow 12.1.1 → 12.2.0 ([#572](https://github.com/existential-birds/amelia/pull/572), [#576](https://github.com/existential-birds/amelia/pull/576), [#577](https://github.com/existential-birds/amelia/pull/577), [#578](https://github.com/existential-birds/amelia/pull/578), [#573](https://github.com/existential-birds/amelia/pull/573))
+
+### Fixed
+
+- **knowledge:** Switch PDF chunker to `HybridChunker` (cl100k_base, max 512 tokens) with a 64-token minimum filter, contextualize chunks with heading breadcrumbs, and unify the search similarity threshold at 0.3 — eliminates noisy single-token chunks and improves semantic relevance of top results ([#587](https://github.com/existential-birds/amelia/pull/587))
+- **knowledge:** Drop document-text previews from the "tiny chunks" warning log to avoid leaking user-uploaded content into operator logs ([#587](https://github.com/existential-birds/amelia/pull/587))
+- **validation:** Reject plans without task structure (missing `### Task N:` headers) before processing, so architect raw output written to the wrong stage no longer slips through to execution ([#580](https://github.com/existential-birds/amelia/pull/580))
+- **dashboard:** Use function-form `manualChunks` in `vite.config.ts` for compatibility with current Rollup/Vite types — restores broken dashboard build ([#582](https://github.com/existential-birds/amelia/pull/582))
+
+### Security
+
+- **deps:** Patch Pygments 2.19.2 → 2.20.0 (Dependabot alert #39: ReDoS in GUID matching) ([#580](https://github.com/existential-birds/amelia/pull/580))
+- **deps:** Patch transformers 4.57.6 → 5.6.2 via docling 2.73 → 2.91 (Dependabot alert #56: Trainer arbitrary code execution) ([#580](https://github.com/existential-birds/amelia/pull/580))
+- **deps:** Patch lodash-es transitives → 4.18.1 via pnpm override (Dependabot alerts #50, #51: prototype pollution and code injection) ([#580](https://github.com/existential-birds/amelia/pull/580))
+- **deps:** Patch uuid transitive → 14.0.0 via pnpm override (Dependabot alert #67: missing buffer bounds check) ([#580](https://github.com/existential-birds/amelia/pull/580))
+- **deps:** Patch vite transitive → 6.4.2 via pnpm override in `docs/site` (Dependabot alert #55: path traversal in optimized deps `.map` handling) ([#580](https://github.com/existential-birds/amelia/pull/580))
+- **deps:** Bump dompurify 3.3.2 → 3.4.0 ([#575](https://github.com/existential-birds/amelia/pull/575))
+- **deps:** Bump postcss 8.5.6 → 8.5.12 in `docs/site` ([#579](https://github.com/existential-birds/amelia/pull/579))
+- **deps:** Bump cryptography 46.0.6 → 46.0.7 ([#572](https://github.com/existential-birds/amelia/pull/572))
+- **deps:** Bump uuid 11.1.0 → 11.1.1 in dashboard ([#583](https://github.com/existential-birds/amelia/pull/583))
+
+## [0.20.0] - 2026-04-07
+
+### Added
+
+- **descriptions:** AI-powered issue description condensation ([#568](https://github.com/existential-birds/amelia/pull/568))
+- **models:** Manual model code entry with DB-backed cache ([#565](https://github.com/existential-birds/amelia/pull/565))
+- **review:** `write_plan` tool, review-fix pipeline, and tool-based submission ([#562](https://github.com/existential-birds/amelia/pull/562))
+
+### Changed
+
+- **dashboard:** Remove activity log and clean up dashboard ([#555](https://github.com/existential-birds/amelia/pull/555))
+
+### Fixed
+
+- **evaluator:** Surface driver errors and fetch diffs on-demand ([#570](https://github.com/existential-birds/amelia/pull/570))
+- **dashboard:** Fix `AskUserQuestionCard` option button text wrapping ([#567](https://github.com/existential-birds/amelia/pull/567))
+
+### Security
+
+- **deps:** Bump vite to patched version ([#569](https://github.com/existential-birds/amelia/pull/569))
+- **deps:** Bump lodash to patched version ([#564](https://github.com/existential-birds/amelia/pull/564))
+- **deps:** Bump aiohttp to patched version ([#563](https://github.com/existential-birds/amelia/pull/563))
+
+## [0.19.0] - 2026-03-27
+
+### Added
+
+- **pr-auto-fix:** Add automated PR comment fix pipeline that monitors review comments and generates fixes ([#539](https://github.com/existential-birds/amelia/pull/539))
+- **dashboard:** Add Develop page for GitHub issue-driven workflow creation, replacing QuickShotModal ([#528](https://github.com/existential-birds/amelia/pull/528))
+- **reviewer:** Internalize review skills with stack-based injection for language-aware code reviews ([#532](https://github.com/existential-birds/amelia/pull/532))
+- **pricing:** Replace static model pricing with live OpenRouter pricing API ([#536](https://github.com/existential-birds/amelia/pull/536))
+
+### Fixed
+
+- **dashboard:** Resolve `task_title` error when selecting GitHub issues in Develop page ([#549](https://github.com/existential-birds/amelia/pull/549))
+- **dashboard:** Replace overly-specific conditionals in profile settings with generic handling ([#526](https://github.com/existential-birds/amelia/pull/526))
+
+### Removed
+
+- **dashboard:** Remove workflow canvas visualization ([#525](https://github.com/existential-birds/amelia/pull/525))
+
+### Security
+
+- **proxy:** Add per-container token authentication via `X-Amelia-Proxy-Token` header ([#538](https://github.com/existential-birds/amelia/pull/538))
+- **proxy:** Sanitize upstream error messages to prevent information leakage ([#538](https://github.com/existential-birds/amelia/pull/538))
+- **proxy:** Redact profile name from 404 error responses ([#538](https://github.com/existential-birds/amelia/pull/538))
+- **proxy:** Add 10 MB request body size limit ([#538](https://github.com/existential-birds/amelia/pull/538))
+- **sandbox:** Default `network_allowlist_enabled` to `true` for Docker sandboxes ([#538](https://github.com/existential-birds/amelia/pull/538))
+- **network:** Restrict DNS to Docker's internal resolver (127.0.0.11) ([#538](https://github.com/existential-birds/amelia/pull/538))
+- **docker:** Only grant `NET_ADMIN`/`NET_RAW` capabilities when network allowlist is enabled ([#538](https://github.com/existential-birds/amelia/pull/538))
+
+## [0.18.0] - 2026-03-07
+
+### Added
+
+- **sandbox:** Add Daytona cloud sandbox provider for remote code execution ([#509](https://github.com/existential-birds/amelia/pull/509))
+- **dashboard:** Auto-populate task title from plan/design document H1 heading ([#515](https://github.com/existential-birds/amelia/pull/515))
+- **server:** Bridge EventBus events to server console via loguru for unified observability ([#504](https://github.com/existential-birds/amelia/pull/504))
+- **drivers:** Add token usage tracking to Codex CLI driver ([#503](https://github.com/existential-birds/amelia/pull/503))
+
+### Changed
+
+- **plan-extraction:** Consolidate plan extraction to regex-only, removing LLM dependency for faster and more predictable parsing ([#516](https://github.com/existential-birds/amelia/pull/516))
+- **dashboard:** Remove Roundtable/Capacity placeholders and move Costs to Agent Ops section ([#510](https://github.com/existential-birds/amelia/pull/510))
+
+### Fixed
+
+- **dashboard:** Fix bulk model dropdown for OpenRouter and agent card layout overflow ([#519](https://github.com/existential-birds/amelia/pull/519))
+- **dashboard:** Restore profile settings modal save and clean up error handling ([#517](https://github.com/existential-birds/amelia/pull/517))
+- **dashboard:** Shrink workflow canvas nodes to fit within viewport ([#519](https://github.com/existential-birds/amelia/pull/519))
+- **external_plan:** Resolve Quick Shot timeout and duplicate plan file creation ([#514](https://github.com/existential-birds/amelia/pull/514))
+- **types:** Audit and resolve `type: ignore` comments across codebase ([#501](https://github.com/existential-birds/amelia/pull/501))
+
+### Security
+
+- **deps:** Bump dompurify to 3.3.2 to address XSS vulnerability ([#521](https://github.com/existential-birds/amelia/pull/521))
+- **deps:** Bump minimatch to fix ReDoS vulnerability ([#502](https://github.com/existential-birds/amelia/pull/502))
+
+## [0.17.0] - 2026-02-22
+
+### Added
+
+- **pipeline:** Add plan validation feedback loop that automatically re-validates plans after architect revisions ([#493](https://github.com/existential-birds/amelia/pull/493))
+- **brainstorm:** Render `ask_user_question` tool calls as interactive cards in the dashboard ([#489](https://github.com/existential-birds/amelia/pull/489))
+- **drivers:** Add `CodexCliDriver` for OpenAI Codex CLI integration with subprocess-based NDJSON streaming ([#477](https://github.com/existential-birds/amelia/pull/477))
+
+### Changed
+
+- **Breaking:** Replace legacy `cli` driver with explicit `claude` and `codex` drivers ([#477](https://github.com/existential-birds/amelia/pull/477))
+
+  The generic `driver: "cli"` value has been split into explicit driver keys:
+  - `claude` — wraps the Claude CLI binary
+  - `codex` — wraps the OpenAI Codex CLI binary
+  - `api` — unchanged (direct OpenRouter API calls)
+
+  **Migration:** Update all profiles that use `driver: "cli"` to `driver: "claude"`. Legacy `cli` values are now rejected at startup. Recreate profiles with `amelia config profile create <name> --driver claude`.
+
+- **Breaking:** Rename `Profile.working_dir` to `Profile.repo_root` for clarity ([#479](https://github.com/existential-birds/amelia/pull/479))
+
+  **Migration:** Update any code or configuration referencing `working_dir` to use `repo_root` instead. A database migration handles the column rename automatically.
+
+### Fixed
+
+- **architect:** Remove git commit step from plan template that caused unnecessary commit attempts during planning ([#494](https://github.com/existential-birds/amelia/pull/494))
+- **logging:** Replace todo table with styled Rich Panel widget to fix rendering issues ([#492](https://github.com/existential-birds/amelia/pull/492))
+- **dashboard:** Auto-focus input field when agent finishes responding for smoother interaction ([#491](https://github.com/existential-birds/amelia/pull/491))
+- **drivers:** Handle `rate_limit_event` and unknown SDK message types gracefully instead of crashing ([#475](https://github.com/existential-birds/amelia/pull/475))
+- **drivers:** Improve SDK stream handling robustness for edge cases ([#483](https://github.com/existential-birds/amelia/pull/483))
+
+## [0.16.0] - 2026-02-18
+
+### Added
+
+- **cli:** Add `--stream` flag to `start`, `approve`, and `reject` commands for real-time trace output when using the API driver ([#472](https://github.com/existential-birds/amelia/pull/472))
+
+### Fixed
+
+- **db:** Add migration to convert TEXT columns to UUID type, fixing data integrity issues after the uuid.UUID refactor ([#464](https://github.com/existential-birds/amelia/pull/464))
+- **drivers:** Catch transient httpx errors and retry with exponential backoff to improve resilience against network blips ([#466](https://github.com/existential-birds/amelia/pull/466))
+- **drivers:** Handle `openai.APIConnectionError` as a transient error so workflows retry instead of failing permanently ([#471](https://github.com/existential-birds/amelia/pull/471))
+- **agents:** Prevent checkpoint bloat caused by tool_calls/tool_results being double-counted in state ([#456](https://github.com/existential-birds/amelia/pull/456))
+- **agents:** Fix incorrect skill name references in reviewer prompts that caused review steps to fail ([#460](https://github.com/existential-birds/amelia/pull/460))
+- **settings:** Reject relative `working_dir` values in the profile API and use the active profile in the Quick Shot modal ([#470](https://github.com/existential-birds/amelia/pull/470))
+- **quick-shot:** Fix external plan bugs in queue and start paths that prevented plan handoff from completing ([#468](https://github.com/existential-birds/amelia/pull/468))
+- **dashboard:** Fix API model selector not populating correctly in the profile editor ([#467](https://github.com/existential-birds/amelia/pull/467))
+- **logging:** Prevent `KeyError` crash in loguru formatter when log record extras contain nested dicts ([#465](https://github.com/existential-birds/amelia/pull/465))
+
+## [0.15.0] - 2026-02-16
+
+### Added
+
+- **knowledge:** Add Knowledge Library with document ingestion, semantic search, and dashboard UI for uploading, searching, and managing knowledge documents ([#437](https://github.com/existential-birds/amelia/pull/437), [#439](https://github.com/existential-birds/amelia/pull/439), [#441](https://github.com/existential-birds/amelia/pull/441), [#449](https://github.com/existential-birds/amelia/pull/449))
+- **dashboard:** Add sandbox configuration UI to profile settings for configuring container-based isolation ([#440](https://github.com/existential-birds/amelia/pull/440))
+- **dashboard:** Improve plan import UX with better file handling and validation feedback ([#452](https://github.com/existential-birds/amelia/pull/452))
+- **core:** Use slugified IDs for brainstorm workflow handoff to implementation ([#445](https://github.com/existential-birds/amelia/pull/445))
+
+### Fixed
+
+- **pipelines:** Scope reviewer diff to last developer pass instead of entire branch history ([#450](https://github.com/existential-birds/amelia/pull/450))
+- **drivers:** Retry transient model provider errors instead of crashing the workflow ([#446](https://github.com/existential-birds/amelia/pull/446))
+- **server:** Summarize STAGE_COMPLETED output to avoid JSONB size limit errors ([#444](https://github.com/existential-birds/amelia/pull/444))
+- **server:** Respect stream_tool_results setting for trace event broadcasting ([#442](https://github.com/existential-birds/amelia/pull/442))
+- **brainstorm:** Resolve plan output path and handle None stage output gracefully ([#447](https://github.com/existential-birds/amelia/pull/447))
+
+## [0.14.0] - 2026-02-14
+
+### Added
+
+- **sandbox:** Add DevContainer-based sandbox for isolated code execution with Docker containers, LLM proxy, git worktree management, and worker entrypoint ([#419](https://github.com/existential-birds/amelia/pull/419), [#424](https://github.com/existential-birds/amelia/pull/424), [#428](https://github.com/existential-birds/amelia/pull/428))
+- **prompts:** Add configurable developer system prompt via prompt configuration system ([#431](https://github.com/existential-birds/amelia/pull/431))
+
+### Changed
+
+- **Breaking:** `DriverInterface.cleanup_session()` is now async
+
+  **Migration:** Change `driver.cleanup_session(session_id)` to `await driver.cleanup_session(session_id)`. Custom driver implementations must update the method signature from `def cleanup_session(...)` to `async def cleanup_session(...)`.
+
+- **drivers:** Remove support for legacy driver values (`cli:claude`, `api:openrouter`). Use canonical forms `cli` and `api` instead.
+
+### Security
+
+- **deps:** Update cryptography from 46.0.3 to 46.0.5 ([#425](https://github.com/existential-birds/amelia/pull/425))
+
+## [0.13.0] - 2026-02-08
+
+### Changed
+
+- **Breaking:** Migrate from SQLite to PostgreSQL for all server data storage ([#406](https://github.com/existential-birds/amelia/pull/406))
+
+  **Migration:** Amelia now requires a running PostgreSQL instance. Install PostgreSQL and create a database, or use the provided Docker Compose setup (`docker compose up -d postgres`). Set `AMELIA_DATABASE_URL` to your connection string (default: `postgresql://localhost:5432/amelia`). Schema migrations run automatically on server startup. SQLite databases are not migrated — reconfigure profiles via CLI or dashboard after upgrading.
+
+### Fixed
+
+- **reviewer:** Align prompt format with parser expectations and improve fallback handling for unparseable reviews ([#416](https://github.com/existential-birds/amelia/pull/416))
+
+## [0.12.0] - 2026-02-07
+
+### Added
+
+- **oracle:** Add Oracle consultation system for querying LLMs about architecture and design decisions during workflows ([#372](https://github.com/existential-birds/amelia/pull/372))
+- **recovery:** Implement workflow recovery after server restart, automatically resuming in-progress workflows ([#376](https://github.com/existential-birds/amelia/pull/376))
+- **dashboard:** Add agent-aware model picker with models.dev integration for browsing and selecting models per agent ([#398](https://github.com/existential-birds/amelia/pull/398))
+- **dashboard:** Add ProfileSelect dropdown to QuickShotModal for choosing a profile before starting workflows ([#401](https://github.com/existential-birds/amelia/pull/401))
+- **server:** Auto-build dashboard on `amelia dev` startup so the bundled UI is always up to date ([#366](https://github.com/existential-birds/amelia/pull/366))
+
+### Changed
+
+- **Breaking:** Rename `events` table to `workflow_log` with filtered persistence to reduce database size ([#402](https://github.com/existential-birds/amelia/pull/402))
+
+  **Migration:** Delete your existing database file (`~/.amelia/amelia.db`) before starting Amelia, or run the server which will auto-migrate the schema. The `events` table has been renamed to `workflow_log` and only user-facing events are persisted.
+
+- **Breaking:** Remove `tool_calls` and `tool_results` fields from PlanCache ([#391](https://github.com/existential-birds/amelia/pull/391))
+
+  **Migration:** No action required. Cached plans will be re-fetched on next access.
+
+- **server:** Simplify ServerExecutionState by removing unused fields (`current_stage`, `planned_at`, `last_error_context`, `consecutive_errors`, `stage_timestamps`) and `state_json` blob in favor of discrete columns ([#383](https://github.com/existential-birds/amelia/pull/383), [#384](https://github.com/existential-birds/amelia/pull/384), [#385](https://github.com/existential-birds/amelia/pull/385), [#386](https://github.com/existential-birds/amelia/pull/386), [#389](https://github.com/existential-birds/amelia/pull/389))
+
+### Removed
+
+- Remove unused `amelia/ext/` extension system (hooks, registry, protocols) ([#388](https://github.com/existential-birds/amelia/pull/388))
+- Remove `planning` workflow status in favor of unified state transitions ([#375](https://github.com/existential-birds/amelia/pull/375))
+
+### Fixed
+
+- **server:** Update brainstorm service for deepagents v0.3.12 compatibility and fix git worktree validation ([#404](https://github.com/existential-birds/amelia/pull/404))
+- **server:** Skip plan file rewrite when file is already at target content, avoiding unnecessary disk writes ([#400](https://github.com/existential-birds/amelia/pull/400))
+- **dashboard:** Fix tracker value mismatch in settings and resolve test warnings ([#399](https://github.com/existential-birds/amelia/pull/399))
+- **dashboard:** Hide completed tool pips in execution strip for cleaner workflow visualization ([#377](https://github.com/existential-birds/amelia/pull/377))
+- **dashboard:** Deduplicate artifacts in brainstorm store to prevent duplicate entries ([#374](https://github.com/existential-birds/amelia/pull/374))
+
+## [0.11.0] - 2026-01-26
+
+### Added
+
+- **orchestrator:** Add replan workflow for blocked plans, allowing the Architect to revise rejected plans without restarting the workflow ([#361](https://github.com/existential-birds/amelia/pull/361))
+- **orchestrator:** Add external plan import capability to bypass Architect planning and supply a pre-written plan ([#347](https://github.com/existential-birds/amelia/pull/347))
+- **dashboard:** Add plan import UI with file preview for importing external plans into workflows ([#351](https://github.com/existential-birds/amelia/pull/351))
+- **drivers:** Add `allowed_tools` parameter for restricting which tools an agent can use ([#360](https://github.com/existential-birds/amelia/pull/360))
+- **cli:** Add tracker prompt to first-time setup for guided onboarding ([#352](https://github.com/existential-birds/amelia/pull/352))
+- **events:** Add task progress events for real-time dashboard activity log updates ([#336](https://github.com/existential-birds/amelia/pull/336))
+
+### Changed
+
+- **Breaking:** Per-agent driver configuration replaces global driver/model settings ([#279](https://github.com/existential-birds/amelia/pull/279))
+
+  **Migration:** Delete your existing database file (`~/.amelia/amelia.db`) before starting Amelia. The database schema has changed - the `profiles` table now uses a single `agents` JSON column instead of `driver`, `model`, `validator_model`, `max_review_iterations`, and `max_task_review_iterations` columns. You will need to recreate your profiles using `amelia config profile create`.
+
+- **types:** Simplify DriverType (`cli:claude` → `cli`, `api:openrouter` → `api`) and TrackerType (`noop` → `none`) enums ([#333](https://github.com/existential-birds/amelia/issues/333))
+
+  **Migration:** Existing database values are automatically migrated on server startup. No manual action required.
+
+### Fixed
+
+- **reviewer:** Remove legacy parsing that incorrectly captured non-issue bullets as review findings ([#350](https://github.com/existential-birds/amelia/pull/350))
+- **dashboard:** Fix agent card layout in profile modal ([#331](https://github.com/existential-birds/amelia/pull/331))
+- **docs:** Remove broken Bebas Neue font symlink ([#329](https://github.com/existential-birds/amelia/pull/329))
+
+### Security
+
+- **deps:** Update python-multipart from 0.0.21 to 0.0.22 ([#362](https://github.com/existential-birds/amelia/pull/362))
+
+## [0.10.0] - 2026-01-22
+
+### Added
+
+- **brainstorm:** Add brainstorming sessions backend with WebSocket streaming for interactive spec building ([#302](https://github.com/existential-birds/amelia/pull/302))
+- **dashboard:** Add Spec Builder UI for brainstorming sessions with real-time chat interface ([#312](https://github.com/existential-birds/amelia/pull/312))
+- **dashboard:** Add costs view with multi-model visualization and analytics ([#314](https://github.com/existential-birds/amelia/pull/314))
+- **dashboard:** Add mobile command bar and compact page headers for improved mobile experience ([#324](https://github.com/existential-birds/amelia/pull/324))
+- **pipelines:** Add pipeline abstraction layer with Implementation and Review pipelines for modular workflow composition ([#295](https://github.com/existential-birds/amelia/pull/295))
+- **agents:** Preserve plan_markdown across multi-task execution for context continuity ([#289](https://github.com/existential-birds/amelia/pull/289))
+
+### Changed
+
+- **Breaking:** Unify configuration with database-backed profiles and settings, replacing YAML-based configuration ([#322](https://github.com/existential-birds/amelia/pull/322))
+
+  **Migration:** Configuration is now stored in SQLite database instead of `settings.amelia.yaml`. Use the new CLI commands to manage configuration:
+  - `amelia config profile list` - List all profiles
+  - `amelia config profile create <name>` - Create a new profile
+  - `amelia config profile edit <name>` - Edit profile settings
+  - `amelia config settings` - View/edit server settings
+
+  Existing YAML configurations must be manually migrated using these commands.
+
+- **dashboard:** Redesign job queue with industrial card layout for improved workflow visibility ([#320](https://github.com/existential-birds/amelia/pull/320))
+- **core:** Migrate from ExecutionState to ImplementationState for cleaner state management ([#296](https://github.com/existential-birds/amelia/pull/296))
+
+### Removed
+
+- **core:** Remove legacy orchestrator.py and state.py in favor of pipeline-based architecture ([#297](https://github.com/existential-birds/amelia/pull/297))
+
+### Fixed
+
+- **dashboard:** Improve workflow detail UI responsiveness on smaller screens ([#319](https://github.com/existential-birds/amelia/pull/319))
+- **orchestrator:** Remove duplicate STAGE_STARTED emission in planning flow ([#303](https://github.com/existential-birds/amelia/pull/303))
+
+## [0.9.0] - 2026-01-15
+
+### Added
+
+- **server:** Add workflow queueing and batch execution for running multiple workflows sequentially ([#264](https://github.com/existential-birds/amelia/pull/264))
+  - New `pending` workflow status allows queuing workflows for later execution
+  - CLI `amelia queue` command and `--queue` flag to queue workflows
+  - API endpoints for starting pending workflows and batch execution
+  - Dashboard displays pending workflows with start/cancel controls
+- **orchestrator:** Add planning status and LangGraph checkpointing for `plan_now` mode ([#269](https://github.com/existential-birds/amelia/pull/269))
+  - New `planning` workflow status shown during architect planning phase
+  - LangGraph checkpointing preserves state during human approval interrupts
+  - Dashboard PlanningIndicator component shows planning progress
+- **dashboard:** Add design document import for Quick Shot modal ([#282](https://github.com/existential-birds/amelia/pull/282))
+  - Import task descriptions directly from design document markdown files
+  - Dropdown menu with available design docs from `docs/design/` directory
+
+### Removed
+
+- **core:** Remove unused `ExecutionState.workflow_status`, `SafeShellExecutor`, and `SafeFileWriter` ([#275](https://github.com/existential-birds/amelia/pull/275))
+
+### Fixed
+
+- **drivers:** Prevent premature DeepAgents agent termination and improve reliability ([#278](https://github.com/existential-birds/amelia/pull/278))
+- **reviewer:** Use beagle markdown format for agentic reviews ([#257](https://github.com/existential-birds/amelia/pull/257))
+- **reviewer:** Rename remaining `comment_count` to `issue_count` for consistency ([#259](https://github.com/existential-birds/amelia/pull/259))
+
+## [0.8.0] - 2026-01-09
+
+### Added
+
+- **drivers:** Add driver-agnostic token usage tracking ([#252](https://github.com/existential-birds/amelia/pull/252))
+  - Unified `DriverUsage` model tracks tokens, cost, and duration across all driver types
+  - Both API and CLI drivers now emit consistent usage metrics
+  - Orchestrator aggregates usage per-agent for dashboard cost breakdown
+
+### Changed
+
+- **Breaking:** Auto-infer provider from driver setting, removing redundant configuration ([#254](https://github.com/existential-birds/amelia/pull/254))
+
+  **Migration:** Remove `provider` field from profile configuration. The provider is now automatically inferred from the driver setting (e.g., `api:openrouter` infers OpenRouter provider).
+
+## [0.7.0] - 2026-01-08
+
+### Added
+
+- **dashboard:** Add Quick Shot modal for rapid workflow creation ([#250](https://github.com/existential-birds/amelia/pull/250))
+  - Start ad-hoc tasks directly from the sidebar without navigating to a new page
+  - Input field for task description with keyboard shortcut support
+- **orchestrator:** Add task-based execution for multi-task plans ([#245](https://github.com/existential-birds/amelia/pull/245))
+  - Architect plans can now specify multiple tasks that execute sequentially
+  - Developer node iterates through tasks with per-task completion tracking
+  - Progress events stream task completion status to dashboard
+
+### Fixed
+
+- **dashboard:** Fix logging performance and memory issues ([#249](https://github.com/existential-birds/amelia/pull/249))
+  - Reduce excessive console logging that caused UI slowdowns
+  - Fix memory leak from unbounded event accumulation in workflow store
+
+## [0.6.0] - 2026-01-08
+
+### Added
+
+- **cli:** Add `--task` option to run tasks instantly without creating issues first ([#241](https://github.com/existential-birds/amelia/pull/241))
+  - Execute ad-hoc tasks directly via `amelia start --task "description"` without tracker integration
+  - Uses noop tracker with synthetic issue for immediate execution
+
+### Changed
+
+- **events:** Unify StreamEvent and WorkflowEvent into single event system ([#239](https://github.com/existential-birds/amelia/pull/239))
+  - Simplified event architecture with consistent event types across server and dashboard
+  - Improved real-time streaming reliability with LangGraph native tasks stream mode
+- **orchestrator:** Replace custom stage_event_emitter with LangGraph native tasks stream mode ([#242](https://github.com/existential-birds/amelia/pull/242))
+
+## [0.5.1] - 2026-01-06
+
+### Fixed
+
+- **dashboard:** Show active state for workflow canvas nodes during execution ([#225](https://github.com/existential-birds/amelia/pull/225))
+
+## [0.5.0] - 2026-01-06
+
+### Added
+
+- **orchestrator:** Add plan validator node for LLM-based structured plan extraction ([#221](https://github.com/existential-birds/amelia/pull/221))
+  - Validates architect output into structured fields (goal, plan_markdown, key_files)
+  - Configurable validator model via `Profile.validator_model` for cost optimization
+  - New server configuration: checkpoint retention, stream tool results toggle
+- **architect:** Implement streaming agentic execution for codebase exploration ([#208](https://github.com/existential-birds/amelia/pull/208))
+- **drivers:** Unify agentic message abstraction across API and CLI drivers ([#201](https://github.com/existential-birds/amelia/pull/201))
+
+### Fixed
+
+- **core:** Normalize tool names across drivers to prevent inconsistent state ([#217](https://github.com/existential-birds/amelia/pull/217))
+- **dashboard:** Fix z-index layering of scanlines and vignette overlays ([#216](https://github.com/existential-birds/amelia/pull/216))
+
+## [0.4.1] - 2026-01-01
+
+### Fixed
+
+- **server:** Fix 404 error on `/api/prompts` endpoint when accessed without trailing slash ([#189](https://github.com/existential-birds/amelia/pull/189))
+
+## [0.4.0] - 2026-01-01
+
+### Added
+
+- **prompts:** Add agent prompt configuration system with dashboard UI for customizing agent behavior ([#184](https://github.com/existential-birds/amelia/pull/184))
+  - Configure system prompts for Architect, Reviewer, and Evaluator agents
+  - Default prompt templates with placeholder support (`{issue_description}`, `{plan}`, etc.)
+  - Prompt resolver merges defaults with custom configurations per agent
+  - SQLite persistence layer with version history tracking
+  - New Prompt Configuration page in dashboard with inline editing
+  - Reset prompts to defaults with one click
+
+## [0.3.0] - 2026-01-01
+
+### Added
+
+- **tokens:** Add comprehensive token usage tracking with per-agent cost breakdown in dashboard ([#178](https://github.com/existential-birds/amelia/pull/178))
+  - Track token consumption, cost, and duration from CLI driver executions
+  - New UsageCard dashboard component with per-agent breakdown (model, input/output tokens, cost, time)
+  - SQLite persistence layer for token usage data
+  - Workflow API responses now include `token_summary` field
+  - History and workflow list pages display duration, tokens, and cost metrics
+
+## [0.2.2] - 2025-12-31
+
+### Added
+
+- **reviewer:** Add agentic review mode with markdown rendering for improved review output formatting ([#173](https://github.com/existential-birds/amelia/pull/173))
+- **cli:** Add `/release` command for automated releases with changelog generation ([#172](https://github.com/existential-birds/amelia/pull/172))
+
+## [0.2.1] - 2025-12-31
+
+### Security
+
+- **deps:** Update langgraph-checkpoint-sqlite 3.0.0 → 3.0.1, mcp 1.22.0 → 1.25.0, urllib3 2.5.0 → 2.6.2 to fix CVE-2025-67644, CVE-2025-66416, CVE-2025-66418, CVE-2025-66471 ([#170](https://github.com/existential-birds/amelia/pull/170))
+
+## [0.2.0] - 2025-12-31
+
+### Added
+
+- **drivers:** Add Claude Agent SDK + DeepAgents integration for native agentic execution ([#152](https://github.com/existential-birds/amelia/pull/152))
+- **core:** Add AgenticState model for simplified agentic workflow ([#148](https://github.com/existential-birds/amelia/pull/148))
+- **ext:** Add enterprise extension system with protocol-based hooks for policy, audit, and analytics ([#116](https://github.com/existential-birds/amelia/pull/116))
+- **dashboard:** Add real-time Claude output streaming to dashboard ([#92](https://github.com/existential-birds/amelia/pull/92))
+- **dashboard:** Add batch progress UI and intelligent execution model visualization ([#115](https://github.com/existential-birds/amelia/pull/115))
+- **dashboard:** Add Zustand store, WebSocket hook, and React Router integration ([#51](https://github.com/existential-birds/amelia/pull/51))
+- **dashboard:** Add core workflow UI components ([#58](https://github.com/existential-birds/amelia/pull/58))
+- **dashboard:** Add copy-to-clipboard button for workflow issue ID ([#95](https://github.com/existential-birds/amelia/pull/95))
+- **cli:** Add `amelia dev` command for unified server + dashboard development ([#54](https://github.com/existential-birds/amelia/pull/54))
+- **core:** Add context compiler for agent prompts ([#87](https://github.com/existential-birds/amelia/pull/87))
+- **server:** Add LangGraph execution bridge with interrupt-based approval flow ([#44](https://github.com/existential-birds/amelia/pull/44))
+- **server:** Add workflow retry logic with exponential backoff ([#45](https://github.com/existential-birds/amelia/pull/45))
+- **server:** Add WebSocket real-time event streaming ([#26](https://github.com/existential-birds/amelia/pull/26))
+- **design:** Add Amelia Design System and VitePress documentation site ([#96](https://github.com/existential-birds/amelia/pull/96))
+- **release:** Add automated release process with GitHub Actions ([b2507de](https://github.com/existential-birds/amelia/commit/b2507de))
+
+### Changed
+
+- **Breaking:** Migrate to Claude Agent SDK + DeepAgents, replacing custom driver implementations ([#152](https://github.com/existential-birds/amelia/pull/152))
+
+  **Migration:** Update driver configuration to use `api:openrouter` driver. Custom `cli:claude` driver configurations should migrate to the API-based approach.
+
+- **Breaking:** Simplify orchestrator to agentic execution model, removing structured step-by-step execution ([#150](https://github.com/existential-birds/amelia/pull/150))
+
+  **Migration:** Workflows now run agents autonomously without step-by-step human approval of individual tasks. Remove any custom task-level approval logic.
+
+- **Breaking:** Rewrite agents for agentic execution pattern ([#149](https://github.com/existential-birds/amelia/pull/149))
+
+  **Migration:** Agent interfaces have changed. Custom agents must implement the new `AgenticAgent` protocol.
+
+- **Breaking:** Standardize on OpenRouter as single API provider ([#135](https://github.com/existential-birds/amelia/pull/135))
+
+  **Migration:** Replace `api:openai` driver with `api:openrouter`. Set `OPENROUTER_API_KEY` environment variable.
+
+- **Breaking:** Freeze ExecutionState and Profile models for immutability ([#128](https://github.com/existential-birds/amelia/pull/128))
+
+  **Migration:** State modifications now require creating new state objects. Replace in-place mutations with functional updates.
+
+- **Breaking:** Move profile from state to LangGraph configurable ([#133](https://github.com/existential-birds/amelia/pull/133))
+
+  **Migration:** Access profile via `config["configurable"]["profile"]` instead of `state.profile`.
+
+- **Breaking:** Remove deprecated `start-local` CLI command ([#90](https://github.com/existential-birds/amelia/pull/90))
+
+  **Migration:** Use `amelia start` or `amelia dev` instead.
+
+- **dashboard:** Improve plan display UI with markdown rendering ([#166](https://github.com/existential-birds/amelia/pull/166))
+- **dashboard:** Improve accessibility of sidebar connection status ([#120](https://github.com/existential-birds/amelia/pull/120))
+- **dashboard:** Improve rejection form UX ([#102](https://github.com/existential-birds/amelia/pull/102))
+- **core:** Rename `plan-only` command to `plan` in CLI ([#165](https://github.com/existential-birds/amelia/pull/165))
+- **drivers:** Return session_id from generate method for session continuity ([#130](https://github.com/existential-birds/amelia/pull/130))
+- **core:** Implement intelligent batched execution model for orchestrator ([#103](https://github.com/existential-birds/amelia/pull/103))
+- **backend:** Improve orchestration and streaming support ([#79](https://github.com/existential-birds/amelia/pull/79))
+- **cli:** Refactor CLI to thin client architecture ([#27](https://github.com/existential-birds/amelia/pull/27))
+- **legal:** Update license from MPL-2.0 to Elastic License 2.0 ([#160](https://github.com/existential-birds/amelia/pull/160))
+
+### Removed
+
+- **dashboard:** Remove structured execution UI (replaced by agentic execution) ([#151](https://github.com/existential-birds/amelia/pull/151))
+
+### Fixed
+
+- **drivers:** Fix DeepAgents structured output using native ToolStrategy ([#161](https://github.com/existential-birds/amelia/pull/161))
+- **cli:** Fix cancel confirmation running outside async context ([#159](https://github.com/existential-birds/amelia/pull/159))
+- **dashboard:** Fix build to static directory and set worktree working_dir ([#137](https://github.com/existential-birds/amelia/pull/137))
+- **server:** Fix orchestrator service for frozen ExecutionState ([#129](https://github.com/existential-birds/amelia/pull/129))
+- **core:** Fix review_iteration persistence in LangGraph state ([#121](https://github.com/existential-birds/amelia/pull/121))
+- **server:** Fix structured logging and dialog behavior ([#117](https://github.com/existential-birds/amelia/pull/117))
+- **core:** Fix merge_sets reducer to handle list input ([#105](https://github.com/existential-birds/amelia/pull/105))
+- **dashboard:** Fix event deduplication in workflow store ([#89](https://github.com/existential-birds/amelia/pull/89))
+- **client:** Fix workflow response schemas to align with server ([#36](https://github.com/existential-birds/amelia/pull/36))
+- **health:** Fix websocket_connections count in health endpoint ([#29](https://github.com/existential-birds/amelia/pull/29))
+- **server:** Fix import error with future annotations for OrchestratorService ([#52](https://github.com/existential-birds/amelia/pull/52))
+- **server:** Improve dependency error messages for tool-installed users ([#50](https://github.com/existential-birds/amelia/pull/50))
+- **server:** Add friendly error for missing langgraph-checkpoint-sqlite ([#48](https://github.com/existential-birds/amelia/pull/48))
+
+### Security
+
+- **dashboard:** Update vitest to fix esbuild CORS vulnerability ([#49](https://github.com/existential-birds/amelia/pull/49))
+
+## [0.0.1] - 2024-12-01
+
+### Added
+
+- Initial release with basic orchestrator architecture
+- LangGraph-based state machine for agent coordination
+- Architect, Developer, and Reviewer agents
+- Driver abstraction for LLM providers
+- Tracker abstraction for issue sources (Jira, GitHub)
+- Profile-based configuration via `settings.amelia.yaml`
+- CLI commands: `start`, `plan`, `review`
+- FastAPI server with WebSocket support
+- React dashboard for workflow visualization
+
+[Unreleased]: https://github.com/existential-birds/amelia/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/existential-birds/amelia/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/existential-birds/amelia/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/existential-birds/amelia/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/existential-birds/amelia/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/existential-birds/amelia/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/existential-birds/amelia/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/existential-birds/amelia/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/existential-birds/amelia/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/existential-birds/amelia/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/existential-birds/amelia/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/existential-birds/amelia/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/existential-birds/amelia/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/existential-birds/amelia/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/existential-birds/amelia/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/existential-birds/amelia/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/existential-birds/amelia/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/existential-birds/amelia/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/existential-birds/amelia/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/existential-birds/amelia/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/existential-birds/amelia/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/existential-birds/amelia/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/existential-birds/amelia/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/existential-birds/amelia/compare/v0.0.1...v0.2.0
+[0.0.1]: https://github.com/existential-birds/amelia/releases/tag/v0.0.1

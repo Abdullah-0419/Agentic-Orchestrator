@@ -1,0 +1,426 @@
+"""Architect agent for generating implementation plans.
+
+This module provides the Architect agent that analyzes issues and produces
+rich markdown implementation plans for agentic execution.
+"""
+from __future__ import annotations
+
+import uuid
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from loguru import logger
+
+from amelia.agents._driver_init import init_agent_driver
+from amelia.core.agentic_state import ToolCall, ToolResult
+from amelia.core.constants import ToolName, resolve_plan_path
+from amelia.core.types import AgentConfig, DriverType, Profile
+from amelia.drivers.base import AgenticMessage, AgenticMessageType
+from amelia.server.models.events import WorkflowEvent
+from amelia.tools.write_plan import create_write_plan_tool
+
+
+if TYPE_CHECKING:
+    from amelia.pipelines.implementation.state import ImplementationState
+    from amelia.sandbox.provider import SandboxProvider
+
+
+class Architect:
+    """Agent responsible for creating implementation plans from issues.
+
+    Generates rich markdown plans that the Developer agent can follow
+    agentically, or provides simplified analysis when full plans aren't needed.
+
+    Attributes:
+        driver: LLM driver interface for plan generation.
+
+    """
+
+    SYSTEM_PROMPT_PLAN = """You are a senior software architect creating implementation plans.
+
+## Your Role
+Write comprehensive implementation plans assuming the executor has ZERO context for the codebase and questionable taste. Document everything they need: which files to touch, complete code, exact commands, how to test it. Give the whole plan as bite-sized tasks.
+
+You have read-only access to explore the codebase before planning.
+
+## Writing Plans
+When available, use the `write_plan` tool to create your implementation plan. This tool takes structured input (goal, architecture, tasks with steps) and renders consistent markdown. If `write_plan` is not available, use the `write_file` tool to create the plan as a markdown file.
+
+## File Paths
+When creating or referencing files, use virtual absolute paths starting with / (e.g., /docs/plan.md, /src/component.ts).
+DO NOT use real filesystem absolute paths like /Users/... or C:\\... - these will be rejected.
+All paths are relative to the working directory but must start with /.
+
+## Principles
+- DRY, YAGNI, TDD
+- Assume executor is skilled but knows nothing about this toolset or problem domain
+- Assume executor doesn't know good test design very well
+
+## Exploration Goals
+Before planning, discover:
+- Existing patterns for similar features
+- File structure and naming conventions
+- Test patterns and coverage approach
+- Dependencies and integration points
+
+## Constraints
+- DO NOT modify any files - exploration only
+- DO NOT run tests, builds, or commands
+- Focus on understanding before planning"""
+
+    def __init__(
+        self,
+        config: AgentConfig,
+        prompts: dict[str, str] | None = None,
+        sandbox_provider: SandboxProvider | None = None,
+    ):
+        """Initialize the Architect agent.
+
+        Args:
+            config: Agent configuration with driver, model, and options.
+            prompts: Optional dict mapping prompt IDs to custom content.
+                Supports keys: "architect.system", "architect.plan".
+            sandbox_provider: Optional shared sandbox provider for sandbox reuse.
+
+        """
+        _init = init_agent_driver(
+            config,
+            prompts=prompts,
+            sandbox_provider=sandbox_provider,
+        )
+        self.driver = _init.driver
+        self.options = _init.options
+        self._prompts = _init.prompts
+        self._driver_type = config.driver
+        self._write_plan_tool_cache: dict[str, Any] = {}  # keyed by root_dir
+
+    @property
+    def plan_prompt(self) -> str:
+        """Get the system prompt for plan generation.
+
+        Returns custom prompt if injected, otherwise class default.
+        """
+        return self._prompts.get("architect.plan", self.SYSTEM_PROMPT_PLAN)
+
+    async def plan(
+        self,
+        state: ImplementationState,
+        profile: Profile,
+        *,
+        workflow_id: uuid.UUID,
+    ) -> AsyncIterator[tuple[ImplementationState, WorkflowEvent]]:
+        """Generate a markdown implementation plan from an issue using agentic execution.
+
+        Creates a rich markdown plan by exploring the codebase with read-only tools,
+        then producing a reference-based plan. Claude writes the plan to a file via
+        the Write tool. Yields state/event tuples as execution progresses.
+
+        Args:
+            state: The execution state containing the issue.
+            profile: The profile containing working directory settings.
+            workflow_id: Workflow ID for stream events (required).
+
+        Yields:
+            Tuples of (updated ImplementationState, WorkflowEvent) as exploration and
+            planning progresses.
+
+        Raises:
+            ValueError: If no issue is present in the state.
+
+        """
+        if not state.issue:
+            raise ValueError("Cannot generate plan: no issue in ImplementationState")
+
+        # Build user prompt from state (simplified - no codebase scan)
+        user_prompt = self._build_agentic_prompt(state, profile)
+
+        cwd = profile.repo_root
+        plan_path = resolve_plan_path(profile.plan_path_pattern, state.issue.id)
+        tool_calls: list[ToolCall] = []
+        tool_results: list[ToolResult] = []
+        raw_output = ""
+        current_state = state
+
+        logger.info(
+            "Architect starting agentic execution",
+            cwd=cwd,
+            plan_path=plan_path,
+        )
+
+        # Build kwargs for driver execution
+        driver_kwargs: dict[str, Any] = {
+            "required_file_path": plan_path,
+        }
+
+        # For API driver: inject write_plan as a custom tool with structured schema
+        # CLI drivers don't support custom tool injection — they use write_file
+        if self._driver_type == DriverType.API:
+            # Cache the tool per root_dir to avoid re-instantiating on every plan() call
+            if cwd not in self._write_plan_tool_cache:
+                self._write_plan_tool_cache[cwd] = create_write_plan_tool(root_dir=cwd)
+            driver_kwargs["tools"] = [self._write_plan_tool_cache[cwd]]
+            driver_kwargs["required_tool"] = "write_plan"
+        else:
+            driver_kwargs["required_tool"] = "write_file"
+
+        try:
+            async for message in self.driver.execute_agentic(
+                prompt=user_prompt,
+                cwd=cwd,
+                instructions=self.plan_prompt,
+                **driver_kwargs,
+            ):
+                event: WorkflowEvent | None = None
+
+                if message.type == AgenticMessageType.THINKING:
+                    event = message.to_workflow_event(workflow_id=workflow_id, agent="architect")
+
+                elif message.type == AgenticMessageType.TOOL_CALL:
+                    call = ToolCall(
+                        id=message.tool_call_id or f"call-{len(tool_calls)}",
+                        tool_name=message.tool_name or "unknown",
+                        tool_input=message.tool_input or {},
+                    )
+                    tool_calls.append(call)
+                    # Log tool call details with explicit tool name in message
+                    input_keys = list(message.tool_input.keys()) if message.tool_input else []
+                    logger.debug(
+                        "Architect tool call",
+                        tool_name=message.tool_name,
+                        input_keys=input_keys,
+                    )
+                    event = message.to_workflow_event(workflow_id=workflow_id, agent="architect")
+
+                elif message.type == AgenticMessageType.TOOL_RESULT:
+                    result = ToolResult(
+                        call_id=message.tool_call_id or f"call-{len(tool_results)}",
+                        tool_name=message.tool_name or "unknown",
+                        output=message.tool_output or "",
+                        success=not message.is_error,
+                    )
+                    tool_results.append(result)
+                    logger.debug(
+                        "Architect tool result recorded",
+                        call_id=result.call_id,
+                    )
+                    event = message.to_workflow_event(workflow_id=workflow_id, agent="architect")
+
+                elif message.type == AgenticMessageType.RESULT:
+                    raw_output = message.content or ""
+                    event = message.to_workflow_event(workflow_id=workflow_id, agent="architect")
+
+                    # In agentic mode, Claude writes the plan via Write tool.
+                    # The orchestrator extracts the plan from tool_calls.
+                    # No need to save the summary response to a file.
+
+                    logger.info(
+                        "Architect plan generated",
+                        agent="architect",
+                        raw_output_length=len(raw_output),
+                        tool_calls_count=len(tool_calls),
+                    )
+
+                    # Log all tool calls at completion
+                    logger.debug(
+                        "Architect completed",
+                        tool_calls_summary=[
+                            {"name": tc.tool_name, "input_keys": list(tc.tool_input.keys())}
+                            for tc in tool_calls
+                        ],
+                        raw_output_preview=raw_output[:300] if raw_output else None,
+                    )
+
+                    # Extract plan_path from write_plan or write_file tool calls
+                    # Note: CLI driver normalizes "Write" to "write_file" (ToolName.WRITE_FILE)
+                    extracted_plan_path: Path | None = None
+                    for tc in tool_calls:
+                        if tc.tool_name in (ToolName.WRITE_PLAN, ToolName.WRITE_FILE) and "file_path" in tc.tool_input:
+                            extracted_plan_path = Path(tc.tool_input["file_path"])
+                            break  # Use first write call (should be the plan)
+
+                    # Yield final state with all updates.
+                    # architect_raw_output holds the RESULT message (e.g., "I've written...").
+                    # plan_markdown is set later by plan_validator_node from the actual file.
+                    current_state = state.model_copy(update={
+                        "tool_calls": tool_calls,
+                        "tool_results": tool_results,
+                        "architect_raw_output": raw_output,
+                        "plan_path": extracted_plan_path,
+                    })
+                    yield current_state, event
+                    continue  # Result is the final message
+
+                if event is not None:
+                    current_state = state.model_copy(update={
+                        "tool_calls": tool_calls,
+                        "tool_results": tool_results,
+                    })
+                    yield current_state, event
+        except (RuntimeError, ValueError) as exc:
+            # RuntimeError: Driver execution failures (CLI/API errors)
+            # ValueError: Invalid input (e.g., empty prompt)
+            logger.exception("Architect agent failed")
+            error_event = AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content=str(exc),
+                is_error=True,
+            ).to_workflow_event(workflow_id=workflow_id, agent="architect")
+            current_state = state.model_copy(update={
+                "tool_calls": tool_calls,
+                "tool_results": tool_results,
+                "architect_error": str(exc),
+            })
+            yield current_state, error_event
+
+    def _build_agentic_prompt(self, state: ImplementationState, profile: Profile) -> str:
+        """Build user prompt for agentic plan generation.
+
+        Simplified prompt that doesn't include codebase scan - the agent
+        will explore using tools.
+
+        Args:
+            state: The current implementation state.
+            profile: The profile containing plan path pattern.
+
+        Returns:
+            Formatted prompt string with issue context.
+
+        Raises:
+            ValueError: If no issue is present in the state.
+
+        """
+        if state.issue is None:
+            raise ValueError("ImplementationState must have an issue")
+
+        parts = []
+        parts.append("## Issue")
+        parts.append(f"**Title:** {state.issue.title}")
+        parts.append(f"**Description:**\n{state.issue.description}")
+
+        # Include design document if present (from brainstorming handoff)
+        if state.design is not None:
+            parts.append("\n## Design Document")
+            parts.append(
+                "The following design document was created during brainstorming. "
+                "Use it as the primary input for your implementation plan. "
+                "If there are conflicts between the design document and the issue "
+                "description, the design document takes precedence as it represents "
+                "refined requirements."
+            )
+            parts.append(f"\n{state.design.content}")
+
+        parts.append("\n## Your Task")
+        parts.append(
+            "Explore the codebase to understand relevant patterns and architecture, "
+            "then create a detailed implementation plan for this issue."
+        )
+
+        # Add output instruction with resolved plan path
+        # IMPORTANT: Explicitly require writing to file - without this,
+        # the LLM may just output the plan as text instead of writing to the file.
+        plan_path = resolve_plan_path(profile.plan_path_pattern, state.issue.id)
+        # Ensure path has leading slash for deepagents virtual_mode compatibility
+        if not plan_path.startswith('/'):
+            plan_path = f'/{plan_path}'
+        parts.append("\n## Output (CRITICAL)")
+        parts.append(
+            f"**CRITICAL REQUIREMENT**: Create a markdown plan file at `{plan_path}`.\n\n"
+            "**Preferred method**: Use the `write_plan` tool with structured input (goal, "
+            "architecture_summary, tech_stack, tasks). The tool validates your input and "
+            "renders consistent markdown.\n\n"
+            "**Fallback**: If `write_plan` is not available, use `write_file` to create "
+            f"the markdown file at `{plan_path}` directly.\n\n"
+            "Do NOT just output the plan as text - you MUST use a tool to create the file. "
+            "The workflow will fail if you don't create the plan file."
+        )
+
+        # Task-specific formatting templates
+        parts.append("""
+## Plan Document Header
+
+Every plan MUST start with this header:
+
+```markdown
+# [Feature Name] Implementation Plan
+
+**Goal:** [One sentence describing what this builds]
+
+**Architecture:** [2-3 sentences about approach]
+
+**Tech Stack:** [Key technologies/libraries]
+
+---
+```
+
+## Bite-Sized Task Granularity
+
+Each step is ONE action (2-5 minutes):
+- "Write the failing test" - step
+- "Run it to make sure it fails" - step
+- "Implement the minimal code to make the test pass" - step
+- "Run the tests and make sure they pass" - step
+- "Commit" - step
+
+## Task Structure
+
+CRITICAL: Task headers MUST follow the exact format `### Task N:` (e.g., `### Task 1:`, `### Task 2:`)
+or hierarchical `### Task N.M:` (e.g., `### Task 1.1:`, `### Task 1.2:`).
+The number and colon are required for downstream task processing.
+
+```markdown
+### Task 1: [Component Name]
+
+**Files:**
+- Create: `exact/path/to/file.py`
+- Modify: `exact/path/to/existing.py:123-145`
+- Test: `tests/exact/path/to/test.py`
+
+**Step 1: Write the failing test**
+
+```python
+def test_specific_behavior():
+    result = function(input)
+    assert result == expected
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: FAIL with "function not defined"
+
+**Step 3: Write minimal implementation**
+
+```python
+def function(input):
+    return expected
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `pytest tests/path/test.py::test_name -v`
+Expected: PASS
+
+**Step 5: Verify**
+
+Run the full test suite or linter if relevant to confirm nothing is broken.
+```
+
+## What to Include
+- Exact file paths always
+- Complete code in plan (not "add validation")
+- Exact commands with expected output
+- Reference relevant patterns with file:line syntax
+- Test criteria and edge cases
+- Task dependencies and ordering""")
+
+        # Plan revision feedback (mirrors Developer's review feedback injection)
+        if state.plan_validation_result and not state.plan_validation_result.valid:
+            issues = "\n".join(f"- {i}" for i in state.plan_validation_result.issues)
+            parts.append(
+                f"\n\n## Plan Revision Required\n\n"
+                f"Your previous plan had these structural issues:\n{issues}\n\n"
+                "Please revise the plan file to address all issues above."
+            )
+
+        return "\n".join(parts)

@@ -1,0 +1,524 @@
+"""Implementation pipeline utility functions.
+
+This module contains helper functions specific to the implementation pipeline,
+including plan parsing, task extraction, and git commit utilities.
+
+Plan Format Requirements:
+    Plans are markdown documents. For optimal regex extraction, use:
+    - ``**Goal:** <text>`` for goal extraction (falls back to first ``# heading``)
+    - ``Create: `path``` / ``Modify: `path``` for key file extraction
+    - ``### Task N: <title>`` for task counting
+"""
+
+import asyncio
+import os
+import re
+from pathlib import Path
+
+from langchain_core.runnables.config import RunnableConfig
+from loguru import logger
+
+from amelia.core.types import PlanValidationResult, Profile, Severity
+from amelia.pipelines.implementation.state import ImplementationState
+
+
+def extract_task_count(plan_markdown: str) -> int:
+    """Extract task count from plan markdown by counting ### Task N: patterns.
+
+    Supports both simple numbering (### Task 1:) and hierarchical numbering
+    (### Task 1.1:) formats.
+
+    Args:
+        plan_markdown: The markdown content of the plan.
+
+    Returns:
+        Number of tasks found, defaults to 1 if no task patterns detected.
+    """
+    pattern = r"^### Task \d+(\.\d+)?:"
+    matches = re.findall(pattern, plan_markdown, re.MULTILINE)
+    count = len(matches) if matches else 1
+
+    # Debug: Log task extraction details (without plan content)
+    logger.debug(
+        "extract_task_count analysis",
+        pattern=pattern,
+        match_count=len(matches) if matches else 0,
+        result_count=count,
+        plan_length=len(plan_markdown),
+    )
+
+    return count
+
+
+def validate_plan_structure(
+    goal: str | None,
+    plan_markdown: str,
+) -> PlanValidationResult:
+    """Run structural checks on a plan.
+
+    Checks:
+    - At least one ### Task N: header (simple or hierarchical)
+    - Goal present and not a fallback placeholder
+    - Minimum content length (200 chars)
+
+    Args:
+        goal: Extracted goal string (may be None or fallback placeholder).
+        plan_markdown: The full plan markdown content.
+
+    Returns:
+        PlanValidationResult with valid=True if all checks pass.
+    """
+    issues: list[str] = []
+
+    # Check for task headers (reuses same pattern as extract_task_count)
+    task_pattern = re.compile(r"^### Task \d+(\.\d+)?:", re.MULTILINE)
+    if not task_pattern.search(plan_markdown):
+        issues.append(
+            "No '### Task N:' headers found. Plan must have structured task headers "
+            "with headers like '### Task 1: Component Name'."
+        )
+
+    # Check for goal
+    if not goal or goal == "Implementation plan":
+        issues.append(
+            "No goal found. Plan must include a clear goal statement "
+            "(e.g. '**Goal:** Add user authentication')."
+        )
+
+    # Check minimum content length
+    if len(plan_markdown.strip()) < 200:
+        issues.append(
+            "Plan content is too short to be a complete implementation plan. "
+            "Expected at least 200 characters."
+        )
+
+    if issues:
+        severity = Severity.CRITICAL if len(issues) >= 2 else Severity.MAJOR
+        return PlanValidationResult(valid=False, issues=issues, severity=severity)
+
+    return PlanValidationResult(valid=True, issues=[], severity=Severity.NONE)
+
+
+def extract_task_title(plan_markdown: str, task_index: int) -> str | None:
+    """Extract the title of a specific task from plan markdown.
+
+    Supports both simple (### Task 1: Title) and hierarchical
+    (### Task 1.1: Title) numbering formats.
+
+    Args:
+        plan_markdown: The markdown content of the plan.
+        task_index: 0-indexed task number to extract title for.
+
+    Returns:
+        The task title string, or None if task not found or title is empty.
+    """
+    pattern = r"^### Task \d+(?:\.\d+)?: (.+)$"
+    matches: list[str] = re.findall(pattern, plan_markdown, re.MULTILINE)
+
+    if not matches or task_index >= len(matches):
+        return None
+
+    title = matches[task_index].strip()
+    return title if title else None
+
+
+def _looks_like_plan(text: str) -> bool:
+    """Check if text looks like a plan document with valid structure.
+
+    Used as a fallback when the LLM doesn't use the write tool but outputs
+    the plan as text instead. Validates both plan-like indicators AND
+    that the content has at least one task header for downstream processing.
+
+    Task headers must follow the format: "### Task N:" or "### Task N.M:"
+    where N and M are numbers. This format is required because downstream
+    processing (extract_task_count, extract_task_section, developer node)
+    relies on this pattern to parse and execute tasks sequentially.
+
+    Args:
+        text: The text to check.
+
+    Returns:
+        True if the text contains plan-like indicators and valid task structure.
+    """
+    if not text or len(text) < 100:
+        return False
+
+    # Count plan indicators
+    indicators = 0
+    lower_text = text.lower()
+
+    # Check for common plan headers/sections
+    plan_markers = [
+        "# ",  # Markdown headers
+        "## ",
+        "### task",
+        "### step",
+        "## phase",
+        "**goal:**",
+        "**architecture:**",
+        "**tech stack:**",
+        "implementation plan",
+        "```",  # Code blocks
+    ]
+    for marker in plan_markers:
+        if marker in lower_text:
+            indicators += 1
+
+    # Need at least 3 indicators to consider it a plan
+    if indicators < 3:
+        return False
+
+    # Validate task structure: must have at least one "### Task N:" header
+    # This ensures downstream processing (extract_task_count, developer node) works correctly
+    task_pattern = r"^### Task \d+(\.\d+)?:"
+    has_valid_task = bool(re.search(task_pattern, text, re.MULTILINE))
+    if not has_valid_task:
+        logger.warning(
+            "Plan rejected: missing required task header format '### Task N:' or '### Task N.M:'. "
+            "This format is required for downstream task processing. "
+            "Ensure the architect prompt generates plans with proper task headers.",
+            pattern=task_pattern,
+            text_length=len(text),
+            indicators_found=indicators,
+        )
+    return has_valid_task
+
+
+def _extract_goal_from_plan(plan_content: str) -> str:
+    """Extract goal from plan content using simple pattern matching.
+
+    Looks for common goal patterns in the plan markdown:
+    - **Goal:** <text> (may span multiple lines until blank line, heading, or bold)
+    - # <Title> (first h1 header)
+
+    Args:
+        plan_content: The markdown plan content.
+
+    Returns:
+        Extracted goal or a default placeholder.
+    """
+    # Try to find **Goal:** pattern (multi-line: capture until blank line, heading, or bold)
+    # Use [^\n] with explicit \n to avoid polynomial backtracking with re.DOTALL
+    goal_match = re.search(
+        r"\*\*Goal:\*\*[ \t]*([^\n](?:[^\n]|\n(?!\n|#|\*\*))*)",
+        plan_content,
+    )
+    if goal_match:
+        # Normalize whitespace: collapse newlines and multiple spaces
+        goal = re.sub(r"\s+", " ", goal_match.group(1)).strip()
+        logger.debug("Goal extracted from **Goal:** pattern", goal=goal)
+        return goal
+
+    # Try to find first # header as title
+    title_match = re.search(r"^#\s+(.+?)(?:\n|$)", plan_content, re.MULTILINE)
+    if title_match:
+        title = title_match.group(1).strip()
+        # Remove "Implementation Plan" suffix if present
+        title = re.sub(r"\s*Implementation Plan\s*$", "", title, flags=re.IGNORECASE)
+        logger.debug("Goal extracted from heading fallback", title=title)
+        return f"Implement {title}" if title else "Implementation plan"
+
+    logger.debug("No goal pattern found, using default")
+    return "Implementation plan"
+
+
+def _extract_key_files_from_plan(plan_content: str) -> list[str]:
+    """Extract key files from plan content using pattern matching.
+
+    Looks for file paths in the plan, typically in **Files:** sections
+    or code blocks with file paths.
+
+    Args:
+        plan_content: The markdown plan content.
+
+    Returns:
+        List of file paths found, or empty list.
+    """
+    key_files: list[str] = []
+
+    # Look for patterns like:
+    # - Create: `path/to/file.py`
+    # - Modify: `path/to/file.py`
+    # - Test: `tests/path/test.py`
+    file_patterns = [
+        r"(?:Create|Modify|Test|Edit|Update|Delete):\s*`([^`]+)`",
+        r"(?:Create|Modify|Test|Edit|Update|Delete):\s*(?!`)(\S+\.(?:py|ts|tsx|js|jsx|go|rs|md))",
+    ]
+
+    for pattern in file_patterns:
+        matches = re.findall(pattern, plan_content, re.IGNORECASE)
+        key_files.extend(matches)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_files: list[str] = []
+    for f in key_files:
+        if f not in seen:
+            seen.add(f)
+            unique_files.append(f)
+
+    logger.debug(
+        "Key files extraction complete",
+        file_count=len(unique_files),
+        files=unique_files if unique_files else "(none)",
+    )
+
+    return unique_files
+
+
+def extract_task_section(plan_markdown: str, task_index: int) -> str:
+    """Extract a specific task section with context from plan markdown.
+
+    Returns the plan header (Goal, Architecture, Tech Stack) plus the current
+    Phase header and the specific Task section. This prevents the developer
+    from implementing the entire plan when only one task should be executed.
+
+    Args:
+        plan_markdown: The full markdown content of the plan.
+        task_index: 0-indexed task number to extract.
+
+    Returns:
+        Markdown containing header context plus the specific task section.
+        Falls back to full plan if extraction fails.
+    """
+    # Split into lines for processing
+    lines = plan_markdown.split("\n")
+
+    # Find header section (before first ## Phase or ---)
+    header_end = 0
+    for i, line in enumerate(lines):
+        if line.startswith("## Phase") or line.strip() == "---":
+            header_end = i
+            break
+    else:
+        # No phase marker found, return full plan
+        return plan_markdown
+
+    header_lines = lines[:header_end]
+
+    # Find all task boundaries using regex
+    task_pattern = re.compile(r"^### Task \d+(\.\d+)?:")
+    phase_pattern = re.compile(r"^## Phase \d+:")
+
+    task_starts: list[int] = []
+    phase_for_task: list[tuple[int, str]] = []  # (task_idx, phase_header)
+    current_phase_header = ""
+
+    for i, line in enumerate(lines):
+        if phase_pattern.match(line):
+            current_phase_header = line
+        if task_pattern.match(line):
+            task_starts.append(i)
+            phase_for_task.append((len(task_starts) - 1, current_phase_header))
+
+    if not task_starts or task_index >= len(task_starts):
+        # No tasks found or index out of range, return full plan
+        return plan_markdown
+
+    # Get the task section boundaries
+    task_start = task_starts[task_index]
+    task_end = (
+        task_starts[task_index + 1]
+        if task_index + 1 < len(task_starts)
+        else len(lines)
+    )
+
+    # Get the phase header for this task
+    phase_header = ""
+    for idx, header in phase_for_task:
+        if idx == task_index:
+            phase_header = header
+            break
+
+    # Build the extracted section
+    result_parts = []
+
+    # Add header context
+    result_parts.append("\n".join(header_lines).strip())
+    result_parts.append("\n---\n")
+
+    # Add phase header if available
+    if phase_header:
+        result_parts.append(phase_header)
+        result_parts.append("\n\n")
+
+    # Add the task section
+    task_section = "\n".join(lines[task_start:task_end]).strip()
+    result_parts.append(task_section)
+
+    return "".join(result_parts)
+
+
+class GitCommandError(Exception):
+    """Raised when a git subprocess fails or times out."""
+
+    def __init__(self, returncode: int, stderr: str) -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(f"git exited with {returncode}: {stderr}")
+
+
+async def _run_git(
+    args: list[str],
+    cwd: str | Path,
+    env: dict[str, str],
+    timeout: float = 60.0,
+) -> str:
+    """Run a git subprocess and return its stdout.
+
+    Args:
+        args: Git arguments (e.g. ``["add", "-A"]``).
+        cwd: Working directory for the subprocess.
+        env: Environment variables dict.
+        timeout: Seconds before the process is killed.
+
+    Returns:
+        Decoded stdout from the process.
+
+    Raises:
+        GitCommandError: If the process exits with a non-zero return code.
+        TimeoutError: If the process exceeds *timeout* seconds.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        raise
+
+    rc = proc.returncode or 0
+    if rc != 0:
+        raise GitCommandError(rc, stderr.decode())
+
+    return stdout.decode()
+
+
+async def commit_task_changes(state: ImplementationState, config: RunnableConfig) -> bool:
+    """Commit changes for completed task.
+
+    Args:
+        state: Current execution state.
+        config: Runnable config with profile.
+
+    Returns:
+        True if commit succeeded or no changes to commit, False if commit failed.
+    """
+    profile: Profile | None = config.get("configurable", {}).get("profile")
+    if not profile:
+        raise ValueError("profile is required in config.configurable")
+    working_dir = Path(profile.repo_root)
+
+    task_number = state.current_task_index + 1
+
+    # Disable git prompts to prevent hangs in headless/server contexts
+    git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+    # Stage all changes
+    try:
+        await _run_git(["add", "-A"], cwd=working_dir, env=git_env)
+    except TimeoutError:
+        logger.warning("Timeout staging changes for task commit", task=task_number)
+        return False
+    except GitCommandError as exc:
+        logger.warning("Failed to stage changes for task commit", error=exc.stderr)
+        return False
+
+    # Check if there are staged changes (exit 0 = no changes, 1 = changes exist)
+    try:
+        await _run_git(["diff", "--cached", "--quiet"], cwd=working_dir, env=git_env)
+        # Exit code 0 means no changes (diff is quiet/empty)
+        logger.info("No changes to commit for task", task=task_number)
+        return True
+    except TimeoutError:
+        logger.warning("Timeout checking staged changes for task", task=task_number)
+        return False
+    except GitCommandError as exc:
+        if exc.returncode != 1:
+            logger.warning(
+                "Failed to check staged diff for task commit",
+                returncode=exc.returncode,
+                task=task_number,
+            )
+            return False
+        # returncode 1 means changes exist — continue to commit
+
+    # Commit with task reference
+    issue_key = state.issue.id if state.issue else "unknown"
+    commit_msg = f"feat({issue_key}): complete task {task_number}"
+
+    try:
+        await _run_git(["commit", "-m", commit_msg], cwd=working_dir, env=git_env)
+        logger.info("Committed task changes", task=task_number, message=commit_msg)
+        return True
+    except TimeoutError:
+        logger.warning("Timeout committing task changes", task=task_number)
+        return False
+    except GitCommandError as commit_exc:
+        stderr = commit_exc.stderr
+
+    # Commit failed - check if hooks modified files (common with auto-formatters)
+    logger.debug("Initial commit failed, checking for hook modifications", task=task_number)
+
+    try:
+        await _run_git(["diff", "--quiet"], cwd=working_dir, env=git_env)
+    except TimeoutError:
+        logger.warning("Timeout checking for hook modifications", task=task_number)
+        return False
+    except GitCommandError as exc:
+        if exc.returncode != 1:
+            # Unexpected error
+            logger.warning("Failed to commit task changes", error=stderr)
+            return False
+
+        # returncode 1 = unstaged changes exist (hooks modified files)
+        logger.info(
+            "Git hooks modified files during commit, re-staging and retrying",
+            task=task_number,
+        )
+
+        # Re-stage all changes
+        try:
+            await _run_git(["add", "-A"], cwd=working_dir, env=git_env)
+        except TimeoutError:
+            logger.warning("Timeout re-staging hook modifications", task=task_number)
+            return False
+        except GitCommandError as restage_exc:
+            logger.warning(
+                "Failed to re-stage hook modifications",
+                error=restage_exc.stderr,
+            )
+            return False
+
+        # Retry commit
+        try:
+            await _run_git(["commit", "-m", commit_msg], cwd=working_dir, env=git_env)
+            logger.info(
+                "Committed task changes after hook modifications",
+                task=task_number,
+                message=commit_msg,
+            )
+            return True
+        except TimeoutError:
+            logger.warning("Timeout on commit retry after hook modifications", task=task_number)
+            return False
+        except GitCommandError as retry_exc:
+            logger.warning(
+                "Failed to commit task changes on retry",
+                error=retry_exc.stderr,
+            )
+            return False
+    else:
+        # No unstaged changes, commit failed for another reason
+        logger.warning("Failed to commit task changes", error=stderr)
+        return False

@@ -1,0 +1,647 @@
+"""Reviewer agent for code review in the Amelia orchestrator."""
+from __future__ import annotations
+
+import asyncio
+import re
+import uuid
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
+
+from loguru import logger
+
+from amelia.agents._driver_init import init_agent_driver
+from amelia.agents.schemas.reviewer import SubmitReviewInput
+from amelia.core.types import AgentConfig, Profile, ReviewResult, Severity
+from amelia.drivers.base import AgenticMessageType, SubmitToolDef
+from amelia.server.models.events import EventLevel, EventType, WorkflowEvent
+
+
+if TYPE_CHECKING:
+    from amelia.pipelines.implementation.state import ImplementationState
+    from amelia.sandbox.provider import SandboxProvider
+    from amelia.server.events.bus import EventBus
+
+
+# Maximum number of review comments to return to the developer.
+# Limits cognitive load and ensures the developer focuses on the most important issues first.
+# Additional issues beyond this limit will be caught in subsequent review cycles.
+MAX_REVIEW_COMMENTS = 20
+
+_MAX_REVIEW_ATTEMPTS = 2
+_REVIEW_RETRY_DELAY = 2.0
+
+REVIEW_OUTPUT_FORMAT = """## Review Summary
+
+[1-2 sentence overview of findings]
+
+## Issues
+
+### Critical (Blocking)
+
+1. [FILE:LINE] ISSUE_TITLE
+   - Issue: Description of what's wrong
+   - Why: Why this matters (bug, type safety, security)
+   - Fix: Specific recommended fix
+
+### Major (Should Fix)
+
+2. [FILE:LINE] ISSUE_TITLE
+   - Issue: ...
+   - Why: ...
+   - Fix: ...
+
+### Minor (Nice to Have)
+
+N. [FILE:LINE] ISSUE_TITLE
+   - Issue: ...
+   - Why: ...
+   - Fix: ...
+
+## Good Patterns
+
+- [FILE:LINE] Pattern description (preserve this)
+
+## Verdict
+
+Ready: Yes | No | With fixes 1-N
+Rationale: [1-2 sentences]"""
+
+
+class Reviewer:
+    """Agent responsible for reviewing code changes against requirements.
+
+    Review Method:
+        agentic_review(): Agentic review using injected review guidelines.
+            Fetches diff via git and reviews against provided skill content.
+            Returns ReviewResult with properly separated issues.
+
+    Attributes:
+        driver: LLM driver interface for generating reviews.
+
+    """
+
+    AGENTIC_REVIEW_PROMPT = f"""You are an expert code reviewer.
+
+## Review Guidelines
+
+{{review_guidelines}}
+
+## Process
+
+1. **Read the Diff**: Read the pre-fetched diff from `{{diff_path}}` — do NOT run `git diff` yourself
+2. **Review**: Evaluate the code against the review guidelines above
+3. **Output**: Provide your review in the following markdown format:
+
+```markdown
+{REVIEW_OUTPUT_FORMAT}
+```
+
+4. **Rules**:
+   - Number every issue sequentially (1, 2, 3...)
+   - Include FILE:LINE for each issue
+   - Separate Issue/Why/Fix clearly
+   - Categorize by actual severity (Critical/Major/Minor)
+   - Only flag real issues - check linters first before flagging style issues
+   - "Ready: Yes" means approved to merge as-is
+
+5. **Submit**: When your review is complete, call the `submit_review` tool with your findings:
+   - `approved`: boolean — true if code is ready to merge as-is
+   - `severity`: string — "critical", "major", "minor", or "none"
+   - `comments`: list of strings — each in format "[severity] [FILE:LINE] Description"
+
+   You MUST call `submit_review` exactly once after completing your review."""
+
+    def __init__(
+        self,
+        config: AgentConfig,
+        event_bus: EventBus | None = None,
+        prompts: dict[str, str] | None = None,
+        agent_name: str = "reviewer",
+        sandbox_provider: SandboxProvider | None = None,
+        review_guidelines: str | None = None,
+    ):
+        """Initialize the Reviewer agent.
+
+        Args:
+            config: Agent configuration with driver, model, and options.
+            event_bus: Optional EventBus for emitting workflow events.
+            prompts: Optional dict mapping prompt IDs to custom content.
+                Supports key: "reviewer.agentic".
+            agent_name: Name used in logs/events. Use "task_reviewer" for task-based
+                execution to distinguish from final review.
+            sandbox_provider: Optional shared sandbox provider for sandbox reuse.
+            review_guidelines: Pre-loaded review skill content injected into
+                the system prompt. When empty, the reviewer uses generic guidelines.
+
+        """
+        _init = init_agent_driver(
+            config,
+            prompts=prompts,
+            sandbox_provider=sandbox_provider,
+        )
+        self.driver = _init.driver
+        self.options = _init.options
+        self._prompts = _init.prompts
+        self._event_bus = event_bus
+        self._agent_name = agent_name
+        self._review_guidelines = review_guidelines or ""
+
+    @property
+    def agentic_prompt(self) -> str:
+        return self._prompts.get("reviewer.agentic", self.AGENTIC_REVIEW_PROMPT)
+
+    def _extract_task_context(self, state: ImplementationState) -> str | None:
+        """Extract task context from execution state.
+
+        For multi-task execution, extracts only the current task section
+        from the full plan.
+
+        Args:
+            state: Current execution state containing plan or goal.
+
+        Returns:
+            Formatted task context string, or None if no context found.
+        """
+        if state.plan_markdown:
+            from amelia.pipelines.implementation.utils import extract_task_section  # noqa: PLC0415
+
+            total = state.total_tasks
+            current = state.current_task_index
+
+            if total == 1:
+                return f"**Task:**\n\n{state.plan_markdown}"
+
+            task_section = extract_task_section(state.plan_markdown, current)
+            return f"**Current Task ({current + 1}/{total}):**\n\n{task_section}"
+
+        if state.goal:
+            return f"**Task Goal:**\n\n{state.goal}"
+
+        if state.issue:
+            issue_parts = []
+            if state.issue.title:
+                issue_parts.append(f"**{state.issue.title}**")
+            if state.issue.description:
+                issue_parts.append(state.issue.description)
+            if issue_parts:
+                return "\n\n".join(issue_parts)
+
+        return None
+
+    def _emit_review_completion(
+        self,
+        workflow_id: uuid.UUID,
+        approved: bool,
+        severity: Severity,
+        comments: list[str],
+    ) -> None:
+        """Emit event for review completion.
+
+        Args:
+            workflow_id: Workflow ID for stream events.
+            approved: Whether the review approved the changes.
+            severity: The severity level of the review findings.
+            comments: List of review comments.
+
+        """
+        if self._event_bus is None:
+            return
+
+        status = "Approved" if approved else "Changes requested"
+
+        content_parts = [f"**Review completed:** {status} (severity: {severity})"]
+
+        # Comments are already filtered to actionable issues at the source
+        if not approved and comments:
+            content_parts.append("\n**Issues to fix:**")
+            for comment in comments:
+                content_parts.append(f"- {comment}")
+        elif comments:
+            content_parts.append("\n**Comments:**")
+            for comment in comments:
+                content_parts.append(f"- {comment}")
+
+        event = WorkflowEvent(
+            id=uuid4(),
+            workflow_id=workflow_id,
+            sequence=0,
+            timestamp=datetime.now(UTC),
+            agent=self._agent_name,
+            event_type=EventType.AGENT_OUTPUT,
+            level=EventLevel.DEBUG,
+            message="\n".join(content_parts),
+        )
+        self._event_bus.emit(event)
+
+    async def agentic_review(
+        self,
+        state: ImplementationState,
+        base_commit: str,
+        profile: Profile,
+        *,
+        workflow_id: uuid.UUID,
+        diff_path: str | None = None,
+    ) -> tuple[ReviewResult, str | None]:
+        """Perform agentic code review that reads the diff from a pre-fetched file.
+
+        The reviewer uses pre-loaded review guidelines (injected at construction
+        via ``review_guidelines``) as its system prompt.  Stack detection and
+        skill loading happen upstream in ``call_reviewer_node``; this method
+        focuses on executing the review and parsing results.
+
+        When ``diff_path`` is provided, the reviewer reads the diff from that
+        pre-fetched file (written by ``call_reviewer_node``) instead of running
+        git diff itself.  This eliminates redundant git diff calls across
+        multiple review passes and avoids "Argument list too long" errors.
+
+        Uses the unified AgenticMessage stream from the driver, independent
+        of the specific driver implementation (CLI or API).
+
+        Args:
+            state: Current execution state containing issue context.
+            base_commit: Git commit hash to diff against.
+            profile: The profile containing working directory settings.
+            workflow_id: Workflow ID for stream events (required).
+            diff_path: Optional path to pre-fetched diff file. When provided,
+                the reviewer reads from this file instead of running git diff.
+
+        Returns:
+            Tuple of (ReviewResult, session_id from driver).
+
+        """
+        # Build the task prompt using shared helper
+        task_context = self._extract_task_context(state) or "Review the code changes."
+
+        if diff_path:
+            prompt = f"""Review the code changes for this task:
+
+{task_context}
+
+The diff is pre-fetched at: {diff_path}
+Read it from that file rather than running git diff.
+
+The changes are against commit: {base_commit}"""
+        else:
+            prompt = f"""Review the code changes for this task:
+
+{task_context}
+
+The changes are in git - diff against commit: {base_commit}"""
+
+        # Build system prompt with base_commit, review_guidelines, and diff_path
+        system_prompt = self.agentic_prompt.format(
+            base_commit=base_commit,
+            review_guidelines=self._review_guidelines,
+            diff_path=diff_path or "(not provided — use git diff)",
+        )
+
+        cwd = profile.repo_root
+        # Always start a fresh session — the reviewer must not resume the
+        # developer's session (different agent, different system prompt).
+        session_id = None
+        new_session_id: str | None = None
+        final_result: str | None = None
+        has_error: bool = False
+
+        logger.info(
+            "Starting agentic review",
+            agent=self._agent_name,
+            base_commit=base_commit,
+            workflow_id=workflow_id,
+        )
+
+        # Build driver-agnostic submit tool. The on_call callback captures the result;
+        # stream interception is kept as a fallback.
+        captured_review: list[SubmitReviewInput] = []
+
+        async def _on_submit_review(args: Any) -> None:
+            if not captured_review:
+                captured_review.append(SubmitReviewInput.model_validate(args))
+            else:
+                logger.warning(
+                    "submit_review called more than once; ignoring duplicate",
+                    agent=self._agent_name,
+                    workflow_id=workflow_id,
+                )
+
+        submit_tool = SubmitToolDef(
+            name="submit_review",
+            description=(
+                "Submit the completed code review. Call this exactly once "
+                "after finishing the review."
+            ),
+            schema=SubmitReviewInput,
+            on_call=_on_submit_review,
+        )
+
+        # Execute agentic review with retry on empty output (e.g. rate-limit silencing the stream)
+        stream_review_data: dict[str, Any] | None = None  # fallback: captured from stream
+        stream_already_called = False
+
+        for attempt in range(_MAX_REVIEW_ATTEMPTS):
+            attempt_result: str | None = None
+            attempt_session_id: str | None = None
+            attempt_has_error: bool = False
+
+            async for msg in self.driver.execute_agentic(
+                prompt=prompt,
+                cwd=cwd,
+                session_id=session_id,
+                instructions=system_prompt,
+                submit_tools=[submit_tool],
+            ):
+                # Emit stream events for visibility using to_workflow_event()
+                if self._event_bus is not None and msg.type != AgenticMessageType.RESULT:
+                    event = msg.to_workflow_event(workflow_id=workflow_id, agent=self._agent_name)
+                    self._event_bus.emit(event)
+
+                # Fallback: capture submit_review from stream (used when driver mocked in tests)
+                if msg.type == AgenticMessageType.TOOL_CALL and msg.tool_name == "submit_review":
+                    if not stream_already_called:
+                        stream_already_called = True
+                        stream_review_data = msg.tool_input
+                        logger.info(
+                            "Captured submit_review tool call",
+                            agent=self._agent_name,
+                            approved=msg.tool_input.get("approved") if msg.tool_input else None,
+                            workflow_id=workflow_id,
+                        )
+                    else:
+                        logger.warning(
+                            "submit_review called more than once; ignoring duplicate",
+                            agent=self._agent_name,
+                            workflow_id=workflow_id,
+                        )
+
+                # Capture final result from RESULT message
+                if msg.type == AgenticMessageType.RESULT:
+                    attempt_session_id = msg.session_id
+                    attempt_result = msg.content
+                    attempt_has_error = msg.is_error
+                    if msg.is_error:
+                        logger.error(
+                            "Agentic review failed",
+                            agent=self._agent_name,
+                            error=msg.content,
+                            workflow_id=workflow_id,
+                        )
+
+            new_session_id = attempt_session_id
+            final_result = attempt_result
+            has_error = attempt_has_error
+
+            if final_result:
+                break  # Got output — no retry needed
+
+            if attempt < _MAX_REVIEW_ATTEMPTS - 1:
+                logger.warning(
+                    "No output from agentic review, retrying",
+                    agent=self._agent_name,
+                    attempt=attempt + 1,
+                    max_attempts=_MAX_REVIEW_ATTEMPTS,
+                    workflow_id=workflow_id,
+                )
+                await asyncio.sleep(_REVIEW_RETRY_DELAY)
+
+        # on_call callback captures result (primary); fall back to stream interception
+        submit_review_captured = captured_review[0] if captured_review else None
+
+        # Prefer submit_review tool data over markdown parsing
+        if submit_review_captured is not None:
+            approved = submit_review_captured.approved
+            severity_str = submit_review_captured.severity.value
+            comments_raw: list[Any] = list(submit_review_captured.comments)
+        elif stream_review_data is not None:
+            approved = stream_review_data.get("approved", True)
+            severity_str = stream_review_data.get("severity", "none")
+            comments_raw = stream_review_data.get("comments", [])
+        else:
+            # Fallback to markdown parsing (transition safety)
+            result = self._parse_review_result(final_result, workflow_id)
+            approved = result.approved
+            severity_str = None
+
+        if severity_str is not None:
+            # Validate severity
+            try:
+                severity = Severity(severity_str)
+            except ValueError:
+                logger.warning(
+                    "Invalid severity from submit_review, defaulting to MINOR",
+                    raw_severity=severity_str,
+                    agent=self._agent_name,
+                    workflow_id=workflow_id,
+                )
+                severity = Severity.MINOR
+
+            comments = [str(c) for c in comments_raw][:MAX_REVIEW_COMMENTS]
+
+            result = ReviewResult(
+                reviewer_persona="Agentic",
+                approved=approved,
+                comments=comments,
+                severity=severity,
+            )
+            logger.info(
+                "Review result from submit_review tool",
+                agent=self._agent_name,
+                approved=approved,
+                severity=severity,
+                comments_count=len(comments),
+                workflow_id=workflow_id,
+            )
+
+        logger.debug(
+            "After _parse_review_result",
+            approved=result.approved,
+            has_error=has_error,
+            severity=result.severity,
+            comments_count=len(result.comments),
+            workflow_id=workflow_id,
+        )
+
+        # If there was an error, ensure result is not approved
+        if has_error and result.approved:
+            logger.warning(
+                "Overriding approved=True due to has_error=True",
+                original_approved=result.approved,
+                workflow_id=workflow_id,
+            )
+            result = ReviewResult(
+                reviewer_persona=result.reviewer_persona,
+                approved=False,
+                comments=result.comments,
+                severity=Severity.MAJOR if result.severity in (Severity.NONE, Severity.MINOR) else result.severity,
+            )
+
+        # Emit completion event
+        self._emit_review_completion(
+            workflow_id,
+            result.approved,
+            result.severity,
+            result.comments,
+        )
+
+        logger.info(
+            "Agentic review completed",
+            agent=self._agent_name,
+            approved=result.approved,
+            issue_count=len(result.comments),
+            severity=result.severity,
+            workflow_id=workflow_id,
+        )
+
+        return result, new_session_id
+
+    def _parse_review_result(self, output: str | None, workflow_id: uuid.UUID) -> ReviewResult:
+        """Parse the agent's output to extract ReviewResult.
+
+        Parses the review markdown format with sections:
+        - Review Summary
+        - Issues (Critical/Major/Minor)
+        - Good Patterns
+        - Verdict
+
+        Args:
+            output: The agent's final output text.
+            workflow_id: Workflow ID for logging.
+
+        Returns:
+            Parsed ReviewResult with issues as comments (not good patterns).
+
+        """
+        if not output:
+            logger.warning(
+                "No output from agentic review after all attempts, defaulting to approved",
+                agent=self._agent_name,
+                workflow_id=workflow_id,
+            )
+            return ReviewResult(
+                reviewer_persona="Agentic",
+                approved=True,
+                comments=[],
+                severity=Severity.NONE,
+            )
+
+        # Parse verdict to determine approval
+        # Handle markdown formatting like **Ready:** Yes, ***Ready***: Yes, or __Ready:__ Yes
+        # Pattern allows any combination of bold/italic markers (*, **, ***, _, __, etc.)
+        verdict_match = re.search(
+            r"[*_]*Ready[*_]*:[*_]*\s*(Yes|No|With fixes[^\n]*)",
+            output,
+            re.IGNORECASE,
+        )
+        logger.debug(
+            "Parsing verdict from review output",
+            verdict_match_found=verdict_match is not None,
+            verdict_text=verdict_match.group(1) if verdict_match else None,
+            output_preview=output[:500] if output else None,
+            workflow_id=workflow_id,
+        )
+
+        # Parse issues from each severity section BEFORE deciding approval,
+        # so the fallback heuristic can use issue presence.
+        issues: list[tuple[str, str]] = []  # (severity, issue_text)
+
+        # Match numbered issues: "1. [FILE:LINE] TITLE" or just "1. TITLE"
+        # Also handles bold-wrapped variants like "**1. [FILE:LINE] TITLE**"
+        issue_pattern = re.compile(
+            r"^\s*\*{0,3}(\d+)\.\s*(?:\[([^\]]+)\])?\s*(.+?)\*{0,3}$",
+            re.MULTILINE,
+        )
+
+        # Determine current section by tracking headers
+        current_severity: str | None = None
+        for line in output.split("\n"):
+            line_stripped = line.strip().lower()
+
+            # Detect severity section headers
+            if "### critical" in line_stripped or "critical (blocking)" in line_stripped:
+                current_severity = "critical"
+            elif "### major" in line_stripped or "major (should fix)" in line_stripped:
+                current_severity = "major"
+            elif "### minor" in line_stripped or "minor (nice to have)" in line_stripped:
+                current_severity = "minor"
+            elif line_stripped.startswith("## good patterns"):
+                current_severity = None  # Stop collecting issues
+            elif line_stripped.startswith("## verdict"):
+                current_severity = None
+
+            # Match issues in current section
+            if current_severity:
+                issue_match = issue_pattern.match(line)
+                if issue_match:
+                    file_line = issue_match.group(2) or ""
+                    title = issue_match.group(3).strip()
+                    if file_line:
+                        issue_text = f"[{current_severity}] [{file_line}] {title}"
+                    else:
+                        issue_text = f"[{current_severity}] {title}"
+                    issues.append((current_severity, issue_text))
+
+        # Decide approval based on verdict match or fallback heuristic
+        if verdict_match:
+            verdict_text = verdict_match.group(1).lower()
+            approved = verdict_text == "yes"
+            logger.debug(
+                "Verdict parsed from regex match",
+                verdict_text=verdict_text,
+                approved=approved,
+                workflow_id=workflow_id,
+            )
+        elif issues:
+            # No Ready: pattern but structured issues found → reject
+            approved = False
+            logger.warning(
+                "No 'Ready:' verdict found but structured issues present, defaulting to not approved",
+                agent=self._agent_name,
+                issue_count=len(issues),
+                output_preview=output[:200] if output else None,
+                workflow_id=workflow_id,
+            )
+        else:
+            # No Ready: pattern and no structured issues → approve
+            approved = True
+            logger.debug(
+                "No 'Ready:' verdict and no structured issues found, defaulting to approved",
+                agent=self._agent_name,
+                output_preview=output[:200] if output else None,
+                workflow_id=workflow_id,
+            )
+
+        # Determine overall severity from highest issue severity
+        severity_priority = {"critical": 3, "major": 2, "minor": 1}
+        if issues:
+            max_severity_value = max(severity_priority.get(sev, 0) for sev, _ in issues)
+            severity_map: dict[int, Severity] = {
+                3: Severity.CRITICAL,
+                2: Severity.MAJOR,
+                1: Severity.MINOR,
+                0: Severity.NONE,
+            }
+            overall_severity = severity_map[max_severity_value]
+        else:
+            overall_severity = Severity.NONE if approved else Severity.MINOR
+
+        # Extract just the issue text for comments
+        comments = [issue_text for _, issue_text in issues]
+
+        if not comments and not approved:
+            comments = ["See review output for details"]
+
+        logger.debug(
+            "Parsed review result",
+            agent=self._agent_name,
+            approved=approved,
+            issue_count=len(comments),
+            severity=overall_severity,
+            workflow_id=workflow_id,
+        )
+
+        return ReviewResult(
+            reviewer_persona="Agentic",
+            approved=approved,
+            comments=comments[:MAX_REVIEW_COMMENTS],
+            severity=overall_severity,
+        )

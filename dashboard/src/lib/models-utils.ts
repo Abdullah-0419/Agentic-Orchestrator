@@ -1,0 +1,180 @@
+import type { ModelInfo, AgentRequirements, PriceTier } from '@/components/model-picker/types';
+import { PRICE_TIER_THRESHOLDS } from '@/components/model-picker/constants';
+
+/**
+ * Model data from OpenRouter /api/v1/models endpoint.
+ */
+interface OpenRouterModel {
+  id: string;
+  name: string;
+  context_length: number | null;
+  pricing: { prompt: string; completion: string };
+  architecture?: { input_modalities: string[]; output_modalities: string[] };
+  top_provider: { context_length: number | null; max_completion_tokens: number | null };
+  supported_parameters?: string[];
+}
+
+/**
+ * Get the valid context length from a model, falling back to top_provider if needed.
+ */
+function getContextLength(model: OpenRouterModel): number | null {
+  if (model.context_length && model.context_length > 0) {
+    return model.context_length;
+  }
+  if (model.top_provider?.context_length && model.top_provider.context_length > 0) {
+    return model.top_provider.context_length;
+  }
+  return null;
+}
+
+/**
+ * Flatten the OpenRouter API response into a flat array of ModelInfo.
+ * Assumes all models support tool calls — the upstream API is queried with
+ * `?supported_parameters=tools` so only tool-capable models are returned.
+ */
+export function flattenModelsData(data: OpenRouterModel[]): ModelInfo[] {
+  const models: ModelInfo[] = [];
+
+  for (const model of data) {
+    // Extract provider from model ID (e.g., "anthropic/claude-sonnet-4" -> "anthropic")
+    const slashIndex = model.id.indexOf('/');
+    const provider = slashIndex !== -1 ? model.id.substring(0, slashIndex) : 'unknown';
+
+    // Parse and validate cost values
+    const inputParsed = parseFloat(model.pricing.prompt);
+    const inputCost = isNaN(inputParsed) ? null : inputParsed * 1_000_000; // Convert per-token to per-1M tokens
+    const outputParsed = parseFloat(model.pricing.completion);
+    const outputCost = isNaN(outputParsed) ? null : outputParsed * 1_000_000; // Convert per-token to per-1M tokens
+
+    models.push({
+      id: model.id,
+      name: model.name,
+      provider,
+      capabilities: {
+        tool_call: true,
+        reasoning: model.supported_parameters?.includes('reasoning') ?? false,
+        structured_output: model.supported_parameters?.includes('response_format') ?? false,
+      },
+      cost: {
+        input: inputCost,
+        output: outputCost,
+      },
+      limit: {
+        context: getContextLength(model),
+        output: model.top_provider?.max_completion_tokens ?? null,
+      },
+      modalities: {
+        input: model.architecture?.input_modalities ?? [],
+        output: model.architecture?.output_modalities ?? [],
+      },
+    });
+  }
+
+  return models;
+}
+
+/**
+ * Determine the price tier for a model based on output cost per 1M tokens.
+ * Returns 'premium' for models with unknown pricing (null).
+ */
+export function getPriceTier(outputCost: number | null): PriceTier {
+  if (outputCost === null) {
+    return 'premium';
+  }
+  if (outputCost < PRICE_TIER_THRESHOLDS.budget) {
+    return 'budget';
+  }
+  if (outputCost <= PRICE_TIER_THRESHOLDS.standard) {
+    return 'standard';
+  }
+  return 'premium';
+}
+
+/**
+ * Check if a model's price tier matches the required tier.
+ *
+ * Tier matching uses inclusive semantics for higher tiers:
+ * - 'budget': only budget models (strict cost constraint)
+ * - 'standard': budget + standard models (moderate cost constraint)
+ * - 'premium': all models (no cost constraint - premium agents can afford anything)
+ *
+ * This allows agents with higher price tiers to use cheaper models when appropriate,
+ * while agents with budget constraints are limited to cost-effective options.
+ */
+function matchesPriceTier(model: ModelInfo, requiredTier: AgentRequirements['priceTier']): boolean {
+  if (requiredTier === 'any') return true;
+
+  const modelTier = getPriceTier(model.cost.output);
+
+  // Budget tier only matches budget models (strict cost constraint)
+  if (requiredTier === 'budget') {
+    return modelTier === 'budget';
+  }
+
+  // Standard tier matches budget and standard (moderate cost constraint)
+  if (requiredTier === 'standard') {
+    return modelTier === 'budget' || modelTier === 'standard';
+  }
+
+  // Premium tier matches all models (no cost constraint)
+  return true;
+}
+
+/**
+ * Filter models by agent requirements.
+ */
+export function filterModelsByRequirements(
+  models: ModelInfo[],
+  requirements: AgentRequirements
+): ModelInfo[] {
+  return models.filter((model) => {
+    // Check all required capabilities
+    for (const cap of requirements.capabilities) {
+      if (!model.capabilities[cap]) {
+        return false;
+      }
+    }
+
+    // Check minimum context size
+    if (model.limit.context === null || model.limit.context < requirements.minContext) {
+      return false;
+    }
+
+    // Check price tier
+    if (!matchesPriceTier(model, requirements.priceTier)) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+/**
+ * Insert or replace a model in a list, keeping all other entries.
+ */
+export function upsertModelInfo(models: ModelInfo[], model: ModelInfo): ModelInfo[] {
+  const existingIndex = models.findIndex((entry) => entry.id === model.id);
+  if (existingIndex === -1) {
+    return [...models, model];
+  }
+
+  const nextModels = [...models];
+  nextModels[existingIndex] = model;
+  return nextModels;
+}
+
+/**
+ * Format context size for display (e.g., 200000 -> "200K").
+ */
+export function formatContextSize(contextSize: number | null): string {
+  if (contextSize === null) {
+    return 'Unknown';
+  }
+  if (contextSize === 0) {
+    return '0';
+  }
+  if (contextSize >= 1_000_000) {
+    return `${Math.round(contextSize / 1_000_000)}M`;
+  }
+  return `${Math.round(contextSize / 1000)}K`;
+}

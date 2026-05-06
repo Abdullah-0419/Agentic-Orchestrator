@@ -1,0 +1,43 @@
+"""API route modules.
+
+Provide FastAPI router instances for the server's HTTP and WebSocket
+endpoints. Include health checks, workflow management, and real-time
+event streaming.
+
+Exports:
+    config_router: Configuration endpoint for dashboard.
+    descriptions_router: AI-powered description condensation endpoint.
+    files_router: File access endpoints for design document import.
+    health_router: Health check and readiness endpoints.
+    paths_router: Path validation endpoints for worktree verification.
+    metrics_router: PR auto-fix metrics and classification audit endpoints.
+    usage_router: Usage metrics endpoints for costs view.
+    websocket_router: WebSocket endpoint for event streaming.
+    workflows_router: REST endpoints for workflow management.
+"""
+from amelia.server.routes.config import router as config_router
+from amelia.server.routes.descriptions import router as descriptions_router
+from amelia.server.routes.files import router as files_router
+from amelia.server.routes.github import router as github_router
+from amelia.server.routes.health import router as health_router
+from amelia.server.routes.knowledge import router as knowledge_router
+from amelia.server.routes.metrics import router as metrics_router
+from amelia.server.routes.paths import router as paths_router
+from amelia.server.routes.usage import router as usage_router
+from amelia.server.routes.websocket import router as websocket_router
+from amelia.server.routes.workflows import router as workflows_router
+
+
+__all__ = [
+    "config_router",
+    "descriptions_router",
+    "files_router",
+    "github_router",
+    "health_router",
+    "knowledge_router",
+    "metrics_router",
+    "paths_router",
+    "usage_router",
+    "websocket_router",
+    "workflows_router",
+]

@@ -1,0 +1,177 @@
+"""Tests for Architect agent prompt injection."""
+from collections.abc import Callable
+from typing import Any
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
+
+from amelia.agents.architect import Architect
+from amelia.core.types import AgentConfig, PlanValidationResult, Profile, Severity
+from amelia.drivers.base import AgenticMessage, AgenticMessageType
+from amelia.pipelines.implementation.state import ImplementationState
+
+
+class TestArchitectPromptInjection:
+    """Tests for Architect agent prompt injection."""
+
+    async def test_uses_injected_plan_prompt(
+        self,
+        mock_driver: MagicMock,
+        mock_execution_state_factory: Callable[..., tuple[ImplementationState, Profile]],
+    ) -> None:
+        """Should use injected plan prompt for plan method.
+
+        The architect.plan() now uses execute_agentic which takes instructions parameter.
+        """
+        custom_plan_prompt = "Custom plan format..."
+        prompts = {"architect.plan": custom_plan_prompt}
+        config = AgentConfig(driver="claude", model="sonnet")
+
+        state, profile = mock_execution_state_factory()
+
+        # Mock execute_agentic as async generator
+        captured_instructions: list[str | None] = []
+        mock_messages = [
+            AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content="**Goal:** Test goal\n\n# Test Plan",
+                session_id="session-1",
+            ),
+        ]
+
+        async def mock_execute_agentic(*args: Any, **kwargs: Any) -> Any:
+            captured_instructions.append(kwargs.get("instructions"))
+            for msg in mock_messages:
+                yield msg
+
+        mock_driver.execute_agentic = mock_execute_agentic
+
+        with patch("amelia.agents._driver_init.get_driver", return_value=mock_driver):
+            architect = Architect(config, prompts=prompts)
+            async for _ in architect.plan(state, profile, workflow_id=uuid4()):
+                pass
+
+        assert len(captured_instructions) == 1
+        assert captured_instructions[0] == custom_plan_prompt
+
+    async def test_falls_back_to_class_default_for_plan(
+        self,
+        mock_driver: MagicMock,
+        mock_execution_state_factory: Callable[..., tuple[ImplementationState, Profile]],
+    ) -> None:
+        """Should use class default when plan prompt not injected.
+
+        The architect.plan() now uses execute_agentic which takes instructions parameter.
+        """
+        config = AgentConfig(driver="claude", model="sonnet")
+        state, profile = mock_execution_state_factory()
+
+        # Mock execute_agentic as async generator
+        captured_instructions: list[str | None] = []
+        mock_messages = [
+            AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content="**Goal:** Test goal\n\n# Test Plan",
+                session_id="session-1",
+            ),
+        ]
+
+        async def mock_execute_agentic(*args: Any, **kwargs: Any) -> Any:
+            captured_instructions.append(kwargs.get("instructions"))
+            for msg in mock_messages:
+                yield msg
+
+        mock_driver.execute_agentic = mock_execute_agentic
+
+        with patch("amelia.agents._driver_init.get_driver", return_value=mock_driver):
+            architect = Architect(config)  # No prompts injected
+            async for _ in architect.plan(state, profile, workflow_id=uuid4()):
+                pass
+
+        # Verify a non-empty default plan prompt is used
+        assert len(captured_instructions) == 1
+        instructions = captured_instructions[0]
+        assert instructions is not None
+        assert len(instructions) > 50
+
+    async def test_plan_prompt_property(
+        self,
+        mock_driver: MagicMock,
+    ) -> None:
+        """Test plan_prompt property returns correct value."""
+        custom_prompt = "Custom plan prompt"
+        config = AgentConfig(driver="claude", model="sonnet")
+
+        with patch("amelia.agents._driver_init.get_driver", return_value=mock_driver):
+            # With custom prompt
+            architect_custom = Architect(config, prompts={"architect.plan": custom_prompt})
+            assert architect_custom.plan_prompt == custom_prompt
+
+            # Without custom prompt (default)
+            architect_default = Architect(config)
+            assert architect_default.plan_prompt
+            assert len(architect_default.plan_prompt) > 50
+
+
+class TestWritePlanPromptReferences:
+    """Tests that system and user prompts reference the write_plan tool."""
+
+    def test_system_prompt_mentions_write_plan(self) -> None:
+        """System prompt should instruct the model to use write_plan tool."""
+        assert "write_plan" in Architect.SYSTEM_PROMPT_PLAN
+
+    async def test_agentic_prompt_instructs_write_plan(
+        self,
+        mock_driver: MagicMock,
+        mock_execution_state_factory: Callable[..., tuple[ImplementationState, Profile]],
+    ) -> None:
+        """User prompt output section should reference write_plan tool."""
+        config = AgentConfig(driver="claude", model="sonnet")
+        state, profile = mock_execution_state_factory()
+
+        with patch("amelia.agents._driver_init.get_driver", return_value=mock_driver):
+            architect = Architect(config)
+            prompt = architect._build_agentic_prompt(state, profile)
+
+        assert "write_plan" in prompt
+
+
+class TestArchitectValidationFeedback:
+    """Tests for validation feedback in architect prompts."""
+
+    async def test_prompt_includes_validation_feedback(
+        self,
+        mock_driver: MagicMock,
+        mock_execution_state_factory: Callable[..., tuple[ImplementationState, Profile]],
+    ) -> None:
+        """When plan_validation_result has issues, prompt should include them."""
+        state, profile = mock_execution_state_factory(
+            plan_validation_result=PlanValidationResult(
+                valid=False,
+                issues=["No ### Task headers found", "Goal section missing"],
+                severity=Severity.MAJOR,
+            ),
+        )
+        config = AgentConfig(driver="claude", model="sonnet")
+
+        with patch("amelia.agents._driver_init.get_driver", return_value=mock_driver):
+            architect = Architect(config)
+            prompt = architect._build_agentic_prompt(state, profile)
+
+        assert "No ### Task headers found" in prompt
+        assert "Goal section missing" in prompt
+
+    async def test_prompt_no_feedback_when_valid(
+        self,
+        mock_driver: MagicMock,
+        mock_execution_state_factory: Callable[..., tuple[ImplementationState, Profile]],
+    ) -> None:
+        """When no validation issues, prompt should not include revision section."""
+        state, profile = mock_execution_state_factory()
+        config = AgentConfig(driver="claude", model="sonnet")
+
+        with patch("amelia.agents._driver_init.get_driver", return_value=mock_driver):
+            architect = Architect(config)
+            prompt = architect._build_agentic_prompt(state, profile)
+
+        assert "plan validator" not in prompt.lower()
+        assert "structural issues" not in prompt.lower()

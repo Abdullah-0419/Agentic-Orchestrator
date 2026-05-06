@@ -1,0 +1,502 @@
+"""Integration tests for brainstorm WebSocket event streaming.
+
+Tests that brainstorm operations emit the correct events via EventBus
+which are then broadcast to WebSocket clients.
+
+Real components:
+- BrainstormService
+- BrainstormRepository with PostgreSQL test database
+- EventBus (with subscriber to capture events)
+- ConnectionManager (for full WebSocket tests)
+
+Only mocked:
+- Driver (execute_agentic as async generator)
+
+Uses httpx.AsyncClient with ASGITransport to keep the ASGI app in the
+same event loop as the asyncpg pool (TestClient creates a separate thread
+with its own event loop, causing asyncpg event loop mismatches).
+"""
+
+import json
+import uuid
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
+
+import httpx
+import pytest
+
+from amelia.server.database.connection import Database
+from amelia.server.database.profile_repository import ProfileRepository
+from amelia.server.events.bus import EventBus
+from amelia.server.events.connection_manager import ConnectionManager
+from amelia.server.models.events import EventDomain, EventType, WorkflowEvent
+from amelia.server.services.brainstorm import BrainstormService
+
+from .conftest import (
+    AsyncClientFactory,
+    _create_app_with_overrides,
+)
+
+
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def test_profile_repository(test_db: Database) -> ProfileRepository:
+    """Create profile repository backed by test database."""
+    return ProfileRepository(test_db)
+
+
+@pytest.fixture
+def captured_events() -> list[WorkflowEvent]:
+    """List to capture emitted events."""
+    return []
+
+
+@pytest.fixture
+def test_event_bus(captured_events: list[WorkflowEvent]) -> EventBus:
+    """Create event bus with subscriber to capture events."""
+    bus = EventBus()
+    bus.subscribe(captured_events.append)
+    return bus
+
+
+@pytest.fixture
+async def test_client(
+    test_brainstorm_service: BrainstormService,
+    mock_driver: MagicMock,
+    tmp_path: Path,
+    async_client_factory: AsyncClientFactory,
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    """Create async test client with real dependencies.
+
+    Uses httpx.AsyncClient with ASGITransport so the ASGI app runs in the
+    same event loop as the asyncpg pool created by test_db.
+    """
+    app = _create_app_with_overrides(
+        test_brainstorm_service, lambda: mock_driver, str(tmp_path)
+    )
+
+    async with async_client_factory(app) as client:
+        yield client
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+async def create_session_and_send_message(
+    client: httpx.AsyncClient,
+    message: str = "Test message",
+) -> str:
+    """Create a brainstorm session and send a message.
+
+    Args:
+        client: The async test client to use.
+        message: The message content to send.
+
+    Returns:
+        The session ID.
+    """
+    create_resp = await client.post(
+        "/api/brainstorm/sessions",
+        json={"profile_id": "test"},
+    )
+    assert create_resp.status_code == 201, (
+        f"Failed to create session: {create_resp.json()}"
+    )
+    session_id = create_resp.json()["session"]["id"]
+
+    msg_resp = await client.post(
+        f"/api/brainstorm/sessions/{session_id}/message",
+        json={"content": message},
+    )
+    assert msg_resp.status_code == 202, (
+        f"Failed to send message: {msg_resp.json()}"
+    )
+
+    return session_id
+
+
+# =============================================================================
+# Test Classes
+# =============================================================================
+
+
+@pytest.mark.integration
+class TestBrainstormEventEmission:
+    """Test that brainstorm operations emit the correct events."""
+
+    async def test_send_message_emits_reasoning_event(
+        self,
+        test_client: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+    ) -> None:
+        """THINKING agentic message should emit BRAINSTORM_REASONING event."""
+        await create_session_and_send_message(test_client)
+
+        # Find reasoning event
+        reasoning_events = [
+            e for e in captured_events
+            if e.event_type == EventType.BRAINSTORM_REASONING
+        ]
+        assert len(reasoning_events) >= 1
+        assert reasoning_events[0].message is not None
+        assert reasoning_events[0].agent == "brainstormer"
+
+    async def test_send_message_emits_tool_call_event(
+        self,
+        test_client: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+    ) -> None:
+        """TOOL_CALL agentic message should emit BRAINSTORM_TOOL_CALL event."""
+        await create_session_and_send_message(test_client)
+
+        # Find tool call event
+        tool_call_events = [
+            e for e in captured_events
+            if e.event_type == EventType.BRAINSTORM_TOOL_CALL
+        ]
+        assert len(tool_call_events) >= 1
+        assert tool_call_events[0].tool_name == "read_file"
+
+    async def test_send_message_emits_tool_result_event(
+        self,
+        test_client: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+    ) -> None:
+        """TOOL_RESULT agentic message should emit BRAINSTORM_TOOL_RESULT event."""
+        await create_session_and_send_message(test_client)
+
+        # Find tool result event
+        tool_result_events = [
+            e for e in captured_events
+            if e.event_type == EventType.BRAINSTORM_TOOL_RESULT
+        ]
+        assert len(tool_result_events) >= 1
+        assert tool_result_events[0].tool_name == "read_file"
+
+    async def test_send_message_emits_text_event(
+        self,
+        test_client: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+    ) -> None:
+        """RESULT agentic message should emit BRAINSTORM_TEXT event."""
+        await create_session_and_send_message(test_client)
+
+        # Find text event
+        text_events = [
+            e for e in captured_events
+            if e.event_type == EventType.BRAINSTORM_TEXT
+        ]
+        assert len(text_events) >= 1
+
+    async def test_send_message_emits_message_complete_event(
+        self,
+        test_client: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+    ) -> None:
+        """Completing a message should emit BRAINSTORM_MESSAGE_COMPLETE event."""
+        await create_session_and_send_message(test_client)
+
+        # Find complete event
+        complete_events = [
+            e for e in captured_events
+            if e.event_type == EventType.BRAINSTORM_MESSAGE_COMPLETE
+        ]
+        assert len(complete_events) == 1
+        assert "message_id" in (complete_events[0].data or {})
+
+    async def test_send_message_events_have_correct_workflow_id(
+        self,
+        test_client: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+    ) -> None:
+        """All events should have the session_id as workflow_id."""
+        session_id = await create_session_and_send_message(test_client)
+
+        # All brainstorm events should have correct workflow_id
+        brainstorm_events = [
+            e for e in captured_events
+            if e.event_type.value.startswith("brainstorm_")
+        ]
+        # Skip session_created which happens before the message
+        message_events = [
+            e for e in brainstorm_events
+            if e.event_type != EventType.BRAINSTORM_SESSION_CREATED
+        ]
+        for event in message_events:
+            assert event.workflow_id == uuid.UUID(session_id)
+
+
+@pytest.mark.integration
+class TestBrainstormArtifactEvents:
+    """Test artifact-related event emission."""
+
+    @pytest.fixture
+    async def test_client_with_write_file(
+        self,
+        test_brainstorm_service: BrainstormService,
+        mock_driver_with_write_file: MagicMock,
+        tmp_path: Path,
+        async_client_factory: AsyncClientFactory,
+    ) -> AsyncGenerator[httpx.AsyncClient, None]:
+        """Create async test client with driver that emits write_file."""
+        app = _create_app_with_overrides(
+            test_brainstorm_service, lambda: mock_driver_with_write_file, str(tmp_path)
+        )
+
+        async with async_client_factory(app) as client:
+            yield client
+
+    async def test_write_file_emits_artifact_created_event(
+        self,
+        test_client_with_write_file: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+    ) -> None:
+        """Successful write_file should emit BRAINSTORM_ARTIFACT_CREATED event."""
+        session_id = await create_session_and_send_message(
+            test_client_with_write_file, message="Create design doc"
+        )
+
+        # Find artifact created event
+        artifact_events = [
+            e for e in captured_events
+            if e.event_type == EventType.BRAINSTORM_ARTIFACT_CREATED
+        ]
+        assert len(artifact_events) == 1
+
+        event = artifact_events[0]
+        assert event.workflow_id == uuid.UUID(session_id)
+        assert event.data is not None
+        assert "docs/plans/" in event.data["path"]
+        assert event.data["path"].endswith(".md")
+        assert "id" in event.data
+
+
+@pytest.mark.integration
+class TestBrainstormWebSocketBroadcast:
+    """Test that events are broadcast to WebSocket clients."""
+
+    async def test_event_bus_connection_manager_wiring(
+        self,
+        test_brainstorm_service: BrainstormService,
+        test_event_bus: EventBus,
+        mock_driver: MagicMock,
+        tmp_path: Path,
+        async_client_factory: AsyncClientFactory,
+    ) -> None:
+        """Verify EventBus is wired to ConnectionManager for WebSocket broadcast.
+
+        This test verifies the integration between:
+        1. BrainstormService emits events via EventBus
+        2. EventBus has a ConnectionManager set
+        3. The wiring allows events to reach WebSocket clients
+
+        The actual event emission is tested in TestBrainstormEventEmission.
+        This test focuses on the WebSocket infrastructure being correctly wired.
+        """
+        # Create a connection manager and link it to the event bus
+        cm = ConnectionManager()
+        test_event_bus.set_connection_manager(cm)
+
+        # Verify the event bus has a connection manager set
+        assert test_event_bus._connection_manager is not None
+
+        app = _create_app_with_overrides(
+            test_brainstorm_service, lambda: mock_driver, str(tmp_path)
+        )
+
+        async with async_client_factory(app) as client:
+            # Create session and send message to trigger event flow
+            await create_session_and_send_message(client, message="Hello")
+
+        # Wait for any pending broadcasts to complete
+        await test_event_bus.wait_for_broadcasts()
+
+        # If we get here without errors, the wiring is correct
+        # Actual event delivery is verified by the event emission tests
+
+
+@pytest.mark.integration
+class TestBrainstormEventDataField:
+    """Test that BrainstormService emits events with correct data for wire format.
+
+    These tests verify that _agentic_message_to_event includes session_id and
+    message_id in the data field, which is required for the WebSocket wire format.
+    """
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [EventType.BRAINSTORM_TEXT, EventType.BRAINSTORM_REASONING],
+    )
+    async def test_event_has_session_id_in_data(
+        self,
+        test_client: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+        event_type: EventType,
+    ) -> None:
+        """Brainstorm events must have session_id in data for wire format."""
+        session_id = await create_session_and_send_message(test_client)
+
+        # Find events of the specified type
+        matching_events = [
+            e for e in captured_events
+            if e.event_type == event_type
+        ]
+        assert len(matching_events) >= 1
+
+        # Verify wire format data is present
+        event = matching_events[0]
+        assert event.data is not None, "Event data field must not be None"
+        assert "session_id" in event.data, "Event must have session_id in data"
+        assert event.data["session_id"] == session_id
+
+    async def test_message_complete_event_has_session_id_and_message_id(
+        self,
+        test_client: httpx.AsyncClient,
+        captured_events: list[WorkflowEvent],
+    ) -> None:
+        """BRAINSTORM_MESSAGE_COMPLETE must have session_id and message_id in data."""
+        session_id = await create_session_and_send_message(test_client)
+
+        # Find complete event
+        complete_events = [
+            e for e in captured_events
+            if e.event_type == EventType.BRAINSTORM_MESSAGE_COMPLETE
+        ]
+        assert len(complete_events) == 1
+
+        # Verify wire format data is present
+        event = complete_events[0]
+        assert event.data is not None, "Event data field must not be None"
+        assert "session_id" in event.data, "Event must have session_id in data"
+        assert event.data["session_id"] == session_id
+        assert "message_id" in event.data, "Event must have message_id in data"
+
+
+@pytest.mark.integration
+class TestBrainstormWireFormat:
+    """Test that brainstorm events use the dedicated wire format over WebSocket."""
+
+    @pytest.fixture
+    def mock_websocket(self) -> AsyncMock:
+        """Create a mock WebSocket connection."""
+        ws = AsyncMock()
+        ws.send_text = AsyncMock()
+        return ws
+
+    @pytest.fixture
+    def connection_manager(self) -> ConnectionManager:
+        """Create a ConnectionManager instance."""
+        return ConnectionManager()
+
+    async def test_brainstorm_events_use_dedicated_wire_format(
+        self,
+        connection_manager: ConnectionManager,
+        mock_websocket: AsyncMock,
+    ) -> None:
+        """Brainstorm domain events arrive with type='brainstorm' over WebSocket."""
+        # Connect and subscribe
+        await connection_manager.connect(mock_websocket)
+        await connection_manager.subscribe_all(mock_websocket)
+
+        # Create a brainstorm event
+        event = WorkflowEvent(
+            id=uuid4(),
+            workflow_id=uuid4(),
+            sequence=0,
+            timestamp=datetime.now(UTC),
+            agent="brainstormer",
+            event_type=EventType.BRAINSTORM_TEXT,
+            message="Streaming text",
+            domain=EventDomain.BRAINSTORM,
+            data={
+                "session_id": "session-123",
+                "message_id": "msg-1",
+                "text": "Hello world",
+            },
+        )
+
+        # Broadcast the event
+        await connection_manager.broadcast(event)
+
+        # Verify the wire format
+        mock_websocket.send_text.assert_called_once()
+        payload = json.loads(mock_websocket.send_text.call_args[0][0])
+
+        assert payload["type"] == "brainstorm"
+        assert payload["event_type"] == "text"  # brainstorm_ prefix stripped
+        assert payload["session_id"] == str(event.workflow_id)
+        assert payload["message_id"] == "msg-1"
+        assert payload["data"]["text"] == "Hello world"
+        assert "timestamp" in payload
+
+    async def test_workflow_events_use_event_wrapper(
+        self,
+        connection_manager: ConnectionManager,
+        mock_websocket: AsyncMock,
+    ) -> None:
+        """Workflow domain events use the standard {type: 'event', payload: ...} format."""
+        await connection_manager.connect(mock_websocket)
+        await connection_manager.subscribe_all(mock_websocket)
+
+        event = WorkflowEvent(
+            id=uuid4(),
+            workflow_id=uuid4(),
+            sequence=1,
+            timestamp=datetime.now(UTC),
+            agent="system",
+            event_type=EventType.WORKFLOW_STARTED,
+            message="Started",
+            domain=EventDomain.WORKFLOW,
+        )
+
+        await connection_manager.broadcast(event)
+
+        mock_websocket.send_text.assert_called_once()
+        payload = json.loads(mock_websocket.send_text.call_args[0][0])
+
+        assert payload["type"] == "event"
+        assert "payload" in payload
+        assert payload["payload"]["id"] == str(event.id)
+
+    async def test_brainstorm_message_complete_event(
+        self,
+        connection_manager: ConnectionManager,
+        mock_websocket: AsyncMock,
+    ) -> None:
+        """Message complete events are correctly routed with error data if present."""
+        await connection_manager.connect(mock_websocket)
+        await connection_manager.subscribe_all(mock_websocket)
+
+        event = WorkflowEvent(
+            id=uuid4(),
+            workflow_id=uuid4(),
+            sequence=0,
+            timestamp=datetime.now(UTC),
+            agent="brainstormer",
+            event_type=EventType.BRAINSTORM_MESSAGE_COMPLETE,
+            message="Complete",
+            domain=EventDomain.BRAINSTORM,
+            data={
+                "session_id": "session-123",
+                "message_id": "msg-1",
+                "error": "Connection failed",
+            },
+        )
+
+        await connection_manager.broadcast(event)
+
+        mock_websocket.send_text.assert_called_once()
+        payload = json.loads(mock_websocket.send_text.call_args[0][0])
+
+        assert payload["type"] == "brainstorm"
+        assert payload["event_type"] == "message_complete"
+        assert payload["data"]["error"] == "Connection failed"

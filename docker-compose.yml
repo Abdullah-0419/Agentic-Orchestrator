@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: amelia
+      POSTGRES_PASSWORD: amelia
+      POSTGRES_DB: amelia
+    ports:
+      - "${AMELIA_DB_PORT:-5434}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-test-db.sh:/docker-entrypoint-initdb.d/init-test-db.sh
+
+volumes:
+  pgdata:

@@ -1,0 +1,1059 @@
+import type {
+  WorkflowSummary,
+  WorkflowStatus,
+  WorkflowDetailResponse,
+  WorkflowListResponse,
+
+  PromptSummary,
+  PromptDetail,
+  VersionSummary,
+  VersionDetail,
+  DefaultContent,
+  CreateWorkflowRequest,
+  CreateWorkflowResponse,
+  StartWorkflowResponse,
+  BatchStartRequest,
+  BatchStartResponse,
+  SetPlanRequest,
+  SetPlanResponse,
+  FileListResponse,
+  ConfigResponse,
+  FileReadResponse,
+  PathValidationResponse,
+  UsageResponse,
+  GitHubIssuesResponse,
+  RequestReviewRequest,
+  PRAutoFixMetricsResponse,
+  ClassificationsResponse,
+  CondenseDescriptionResponse,
+} from '../types';
+import type {
+  KnowledgeDocument,
+  KnowledgeDocumentListResponse,
+  SearchResult,
+} from '../types/knowledge';
+import { parseErrorDetail } from './errors';
+import { API_BASE_URL, createTimeoutSignal } from './utils';
+
+/**
+ * Wraps fetch with timeout support.
+ *
+ * @param url - The URL to fetch.
+ * @param options - Fetch options (method, headers, body, etc.).
+ * @param abortSignal - Optional AbortSignal to cancel the request externally.
+ * @returns The fetch Response.
+ * @throws {ApiError} When the request times out or fails.
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  abortSignal?: AbortSignal
+): Promise<Response> {
+  const timeoutSignal = createTimeoutSignal();
+
+  // Combine timeout signal with optional abort signal
+  const signal = abortSignal
+    ? AbortSignal.any([timeoutSignal, abortSignal])
+    : timeoutSignal;
+
+  try {
+    return await fetch(url, { ...options, signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      // Check if it was an external abort (not timeout)
+      if (abortSignal?.aborted) {
+        throw new ApiError('Request aborted', 'ABORTED', 0);
+      }
+      throw new ApiError('Request timeout', 'TIMEOUT', 408);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Custom error class for API-related errors.
+ *
+ * Extends the standard Error class to include additional context about API failures,
+ * including error codes, HTTP status codes, and optional error details.
+ *
+ * @example
+ * ```typescript
+ * throw new ApiError('Resource not found', 'NOT_FOUND', 404);
+ * ```
+ */
+class ApiError extends Error {
+  /**
+   * Creates a new ApiError instance.
+   *
+   * @param message - Human-readable error message.
+   * @param code - Machine-readable error code (e.g., 'NOT_FOUND', 'VALIDATION_ERROR').
+   * @param status - HTTP status code associated with the error.
+   * @param details - Optional additional error details or metadata.
+   */
+  constructor(
+    message: string,
+    public code: string,
+    public status: number,
+    public details?: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/**
+ * Handles HTTP response parsing and error handling.
+ *
+ * Checks if the response is successful, parses the JSON body, and throws
+ * ApiError if the response indicates an error. Attempts to parse error
+ * details from the response body when available.
+ *
+ * @param response - The fetch Response object to handle.
+ * @returns The parsed JSON response body.
+ * @throws {ApiError} When the response status is not OK (non-2xx status code).
+ *
+ * @example
+ * ```typescript
+ * const response = await fetch('/api/workflows');
+ * const data = await handleResponse<WorkflowListResponse>(response);
+ * ```
+ */
+async function handleResponse<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    let errorData: Record<string, unknown>;
+    try {
+      errorData = await response.json();
+    } catch {
+      throw new ApiError(
+        `HTTP ${response.status}: ${response.statusText}`,
+        'HTTP_ERROR',
+        response.status
+      );
+    }
+
+    // Handle both our ErrorResponse format ({error, code}) and
+    // FastAPI's HTTPException format ({detail})
+    const message = parseErrorDetail(
+      errorData.detail ?? errorData.error,
+      `HTTP ${response.status}: ${response.statusText}`
+    );
+    const code = (errorData.code as string) || 'HTTP_ERROR';
+
+    throw new ApiError(
+      message,
+      code,
+      response.status,
+      errorData.details as Record<string, unknown> | undefined
+    );
+  }
+
+  // Handle responses with no content (e.g., 204 No Content from DELETE)
+  if (response.status === 204 || response.headers?.get('content-length') === '0') {
+    return (void 0) as T;
+  }
+
+  return response.json();
+}
+
+/**
+ * API client for interacting with the Amelia workflow management backend.
+ *
+ * Provides methods for fetching, approving, rejecting, and canceling workflows,
+ * as well as retrieving workflow history.
+ */
+export const api = {
+  /**
+   * Retrieves all active workflows.
+   *
+   * Active workflows are those with status 'in_progress' or 'blocked'.
+   *
+   * @returns Array of workflow summaries for all active workflows.
+   * @throws {ApiError} When the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const workflows = await api.getWorkflows();
+   * console.log(`Found ${workflows.length} active workflows`);
+   * ```
+   */
+  async getWorkflows(): Promise<WorkflowSummary[]> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/active`);
+    const data = await handleResponse<WorkflowListResponse>(response);
+    return data.workflows;
+  },
+
+  /**
+   * Retrieves a single workflow by ID with full details.
+   *
+   * Returns comprehensive workflow information including state, events,
+   * and execution details.
+   *
+   * @param id - The unique identifier of the workflow to retrieve.
+   * @returns Detailed workflow information including full execution state.
+   * @throws {ApiError} When the workflow is not found or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const workflow = await api.getWorkflow('workflow-123');
+   * console.log(`Workflow status: ${workflow.status}`);
+   * ```
+   */
+  async getWorkflow(id: string): Promise<WorkflowDetailResponse> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/${id}`);
+    const data = await handleResponse<WorkflowDetailResponse & { recent_events?: Array<{ event_type: string; sequence: number; data?: Record<string, unknown> }> }>(response);
+
+    // Extract recoverable flag from recent_events in the raw API response
+    // so recovery detection survives page refresh without ephemeral store events.
+    // Only set recoverable when we find a workflow_failed event — an empty array
+    // must leave recoverable undefined so the store-events fallback still works.
+    if (data.status === 'failed' && data.recent_events?.length) {
+      const failedEvents = data.recent_events
+        .filter(e => e.event_type === 'workflow_failed')
+        .sort((a, b) => b.sequence - a.sequence);
+      const latest = failedEvents[0];
+      if (latest) {
+        const recoverable = latest.data?.recoverable;
+        if (typeof recoverable === 'boolean') {
+          data.recoverable = recoverable;
+        }
+      }
+    }
+    // Strip recent_events from the response — they are not part of the frontend type
+    delete (data as unknown as Record<string, unknown>).recent_events;
+
+    return data;
+  },
+
+  /**
+   * Approves a blocked workflow's plan.
+   *
+   * Approving a workflow allows it to proceed with execution after
+   * human review of the proposed plan.
+   *
+   * @param id - The unique identifier of the workflow to approve.
+   * @returns Promise that resolves when the approval is successful.
+   * @throws {ApiError} When the workflow is not found, not in a blocked state, or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * await api.approveWorkflow('workflow-123');
+   * console.log('Workflow approved and will resume execution');
+   * ```
+   */
+  async approveWorkflow(id: string): Promise<void> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/${id}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    await handleResponse(response);
+  },
+
+  /**
+   * Rejects a workflow's plan with feedback.
+   *
+   * Rejecting a workflow sends it back for re-planning with the provided
+   * feedback to guide improvements.
+   *
+   * @param id - The unique identifier of the workflow to reject.
+   * @param feedback - Human feedback explaining why the plan was rejected and what should be changed.
+   * @returns Promise that resolves when the rejection is successful.
+   * @throws {ApiError} When the workflow is not found, not in a blocked state, or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * await api.rejectWorkflow('workflow-123', 'Please add more unit tests to the plan');
+   * console.log('Workflow rejected and sent back for re-planning');
+   * ```
+   */
+  async rejectWorkflow(id: string, feedback: string): Promise<void> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/${id}/reject`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ feedback }),
+    });
+    await handleResponse(response);
+  },
+
+  /**
+   * Requests re-planning for a blocked workflow.
+   *
+   * Sends the workflow back to the Architect for a new plan,
+   * preserving context from the previous attempt.
+   *
+   * @param id - The unique identifier of the workflow to replan.
+   * @returns Promise that resolves when the replan request is successful.
+   * @throws {ApiError} When the workflow is not found, not in a blocked state, or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * await api.replanWorkflow('workflow-123');
+   * console.log('Workflow sent back for re-planning');
+   * ```
+   */
+  async replanWorkflow(id: string): Promise<void> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/${id}/replan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    await handleResponse(response);
+  },
+
+  /**
+   * Cancels a running workflow.
+   *
+   * Canceling immediately stops workflow execution and transitions it
+   * to the 'cancelled' state.
+   *
+   * @param id - The unique identifier of the workflow to cancel.
+   * @returns Promise that resolves when the cancellation is successful.
+   * @throws {ApiError} When the workflow is not found, not in a cancellable state, or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * await api.cancelWorkflow('workflow-123');
+   * console.log('Workflow cancelled successfully');
+   * ```
+   */
+  async cancelWorkflow(id: string): Promise<void> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/${id}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    await handleResponse(response);
+  },
+
+  /**
+   * Resume a failed workflow from its last checkpoint.
+   *
+   * @param id - The unique identifier of the workflow to resume.
+   * @returns Promise that resolves when the resume request is successful.
+   * @throws {ApiError} When the workflow is not found, not in a failed state, or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * await api.resumeWorkflow('workflow-123');
+   * ```
+   */
+  async resumeWorkflow(id: string): Promise<void> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/${id}/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    await handleResponse(response);
+  },
+
+  /**
+   * Retrieves workflow history for completed, failed, and cancelled workflows.
+   *
+   * Makes parallel requests for each status type (completed, failed, cancelled)
+   * since the server only supports single status filtering. Results are combined
+   * and sorted by start time in descending order (most recent first).
+   *
+   * @returns Array of workflow summaries sorted by start time (newest first).
+   * @throws {ApiError} When any of the API requests fail.
+   *
+   * @example
+   * ```typescript
+   * const history = await api.getWorkflowHistory();
+   * console.log(`Found ${history.length} historical workflows`);
+   * history.forEach(w => console.log(`${w.id}: ${w.status}`));
+   * ```
+   */
+  async getWorkflowHistory(): Promise<WorkflowSummary[]> {
+    const statuses: WorkflowStatus[] = ['completed', 'failed', 'cancelled'];
+    const results = await Promise.all(
+      statuses.map(async (status) => {
+        const response = await fetchWithTimeout(`${API_BASE_URL}/workflows?status=${status}`);
+        const data = await handleResponse<WorkflowListResponse>(response);
+        return data.workflows;
+      })
+    );
+    // Flatten and sort by started_at descending (most recent first)
+    return results
+      .flat()
+      .sort((a, b) => {
+        const aTime = a.started_at ? new Date(a.started_at).getTime() : 0;
+        const bTime = b.started_at ? new Date(b.started_at).getTime() : 0;
+        return bTime - aTime;
+      });
+  },
+
+  /**
+   * Creates a new workflow.
+   *
+   * @param request - The workflow creation request.
+   * @returns The created workflow response.
+   * @throws {ApiError} When validation fails, worktree is in use, or API request fails.
+   *
+   * @example
+   * ```typescript
+   * const response = await api.createWorkflow({
+   *   issue_id: 'TASK-001',
+   *   worktree_path: '/Users/me/projects/repo',
+   *   task_title: 'Add logout button',
+   * });
+   * console.log(`Created workflow: ${response.id}`);
+   * ```
+   */
+  async createWorkflow(
+    request: CreateWorkflowRequest
+  ): Promise<CreateWorkflowResponse> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    return handleResponse<CreateWorkflowResponse>(response);
+  },
+
+  /**
+   * Starts a pending workflow.
+   *
+   * Transitions the workflow from 'pending' to 'in_progress' status
+   * and begins execution.
+   *
+   * @param id - The unique identifier of the workflow to start.
+   * @returns The started workflow response with workflow_id and status.
+   * @throws {ApiError} When the workflow is not found, not in pending state, or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const result = await api.startWorkflow('workflow-123');
+   * console.log(`Started workflow: ${result.workflow_id}, status: ${result.status}`);
+   * ```
+   */
+  async startWorkflow(id: string): Promise<StartWorkflowResponse> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/${id}/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    return handleResponse<StartWorkflowResponse>(response);
+  },
+
+  /**
+   * Sets or replaces the plan for a queued workflow.
+   *
+   * Allows importing an external plan either from a file path or inline content.
+   * The workflow must be in 'queued' status. Use `force: true` to overwrite
+   * an existing plan.
+   *
+   * Note: `plan_file` and `plan_content` are mutually exclusive.
+   *
+   * @param id - The unique identifier of the workflow.
+   * @param request - The plan request with either plan_file or plan_content.
+   * @returns Response with extracted goal, key_files, and total_tasks.
+   * @throws {ApiError} When workflow not found, not queued, validation fails, or API request fails.
+   *
+   * @example
+   * ```typescript
+   * // Set plan from file
+   * const result = await api.setPlan('workflow-123', {
+   *   plan_file: 'docs/plans/feature.md',
+   * });
+   *
+   * // Set plan from inline content
+   * const result = await api.setPlan('workflow-123', {
+   *   plan_content: '# Plan\n\n### Task 1: Do thing',
+   *   force: true,
+   * });
+   *
+   * console.log(`Goal: ${result.goal}, Tasks: ${result.total_tasks}`);
+   * ```
+   */
+  async setPlan(id: string, request: SetPlanRequest): Promise<SetPlanResponse> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/${id}/plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    return handleResponse<SetPlanResponse>(response);
+  },
+
+  /**
+   * Lists files in a directory matching a glob pattern.
+   *
+   * @param directory - Relative directory path within the base directory.
+   * @param globPattern - Glob pattern to filter files (default: '*.md').
+   * @param worktreePath - Optional worktree path to use as base directory.
+   *                      If not provided, uses active profile's repo_root.
+   * @returns Response with matching file entries and directory path.
+   * @throws {ApiError} When directory not found or API request fails.
+   *
+   * @example
+   * ```typescript
+   * const result = await api.listFiles('docs/plans', '*.md', '/path/to/worktree');
+   * console.log(`Found ${result.files.length} files in ${result.directory}`);
+   * ```
+   */
+  async listFiles(
+    directory: string,
+    globPattern: string = '*.md',
+    worktreePath?: string
+  ): Promise<FileListResponse> {
+    const params = new URLSearchParams({ directory, glob_pattern: globPattern });
+    if (worktreePath) {
+      params.append('worktree_path', worktreePath);
+    }
+    const response = await fetchWithTimeout(`${API_BASE_URL}/files/list?${params}`);
+    return handleResponse<FileListResponse>(response);
+  },
+
+  /**
+   * Starts multiple pending workflows in batch.
+   *
+   * Allows starting all pending workflows, or filtering by specific IDs
+   * or worktree path. Returns both successfully started workflows and
+   * any errors that occurred.
+   *
+   * @param request - The batch start request with optional filters.
+   * @returns Response with lists of started workflow IDs and any errors.
+   * @throws {ApiError} When the API request fails.
+   *
+   * @example
+   * ```typescript
+   * // Start specific workflows
+   * const result = await api.startBatch({ workflow_ids: ['wf-1', 'wf-2'] });
+   *
+   * // Start all pending for a worktree
+   * const result = await api.startBatch({ worktree_path: '/path/to/repo' });
+   *
+   * console.log(`Started: ${result.started.length}, Errors: ${Object.keys(result.errors).length}`);
+   * ```
+   */
+  async startBatch(request: BatchStartRequest): Promise<BatchStartResponse> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows/start-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    return handleResponse<BatchStartResponse>(response);
+  },
+
+  /**
+   * Fetches open GitHub issues for a profile's repository.
+   *
+   * @param profile - Profile name to resolve repo context.
+   * @param search - Optional search query for filtering.
+   * @param signal - Optional AbortSignal for cancellation.
+   * @returns List of GitHub issue summaries.
+   */
+  async getGitHubIssues(
+    profile: string,
+    search?: string,
+    signal?: AbortSignal,
+  ): Promise<GitHubIssuesResponse> {
+    const params = new URLSearchParams({ profile });
+    if (search) params.set('search', search);
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/github/issues?${params}`,
+      {},
+      signal,
+    );
+    return handleResponse<GitHubIssuesResponse>(response);
+  },
+
+  /**
+   * Condenses a long GitHub issue body using an LLM.
+   *
+   * @param description - The issue body text to condense.
+   * @param profile - Optional profile name; server falls back to active profile.
+   * @returns Condensed description text.
+   */
+  async condenseDescription(
+    description: string,
+    profile?: string,
+  ): Promise<CondenseDescriptionResponse> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/descriptions/condense`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description, profile }),
+    });
+    return handleResponse<CondenseDescriptionResponse>(response);
+  },
+
+  /**
+   * Retrieves the most recent workflow defaults for pre-population.
+   *
+   * @deprecated Will be removed when QuickShotModal is deleted.
+   */
+  async getWorkflowDefaults(): Promise<{
+    worktree_path: string | null;
+    profile: string | null;
+  }> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/workflows?limit=1`);
+    const data = await handleResponse<WorkflowListResponse>(response);
+
+    const mostRecent = data.workflows[0];
+    if (mostRecent) {
+      return {
+        worktree_path: mostRecent.worktree_path,
+        profile: mostRecent.profile,
+      };
+    }
+
+    return { worktree_path: null, profile: null }
+  },
+
+  // ==========================================================================
+  // Prompts API
+  // ==========================================================================
+
+  /**
+   * Get all prompts with current version info.
+   *
+   * @returns Array of prompt summaries.
+   * @throws {ApiError} When the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const prompts = await api.getPrompts();
+   * console.log(`Found ${prompts.length} prompts`);
+   * ```
+   */
+  async getPrompts(): Promise<PromptSummary[]> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/prompts`);
+    const data = await handleResponse<{ prompts: PromptSummary[] }>(response);
+    return data.prompts;
+  },
+
+  /**
+   * Get prompt detail with version history.
+   *
+   * @param id - The unique identifier of the prompt.
+   * @returns Detailed prompt information including version history.
+   * @throws {ApiError} When the prompt is not found or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const prompt = await api.getPrompt('architect.system');
+   * console.log(`Prompt has ${prompt.versions.length} versions`);
+   * ```
+   */
+  async getPrompt(id: string): Promise<PromptDetail> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/prompts/${id}`);
+    return handleResponse<PromptDetail>(response);
+  },
+
+  /**
+   * Get all versions for a prompt.
+   *
+   * @param promptId - The unique identifier of the prompt.
+   * @returns Array of version summaries.
+   * @throws {ApiError} When the prompt is not found or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const versions = await api.getPromptVersions('architect.system');
+   * versions.forEach(v => console.log(`v${v.version_number}: ${v.change_note}`));
+   * ```
+   */
+  async getPromptVersions(promptId: string): Promise<VersionSummary[]> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/prompts/${promptId}/versions`);
+    const data = await handleResponse<{ versions: VersionSummary[] }>(response);
+    return data.versions;
+  },
+
+  /**
+   * Get a specific version with full content.
+   *
+   * @param promptId - The unique identifier of the prompt.
+   * @param versionId - The unique identifier of the version.
+   * @returns The version details including content.
+   * @throws {ApiError} When the version is not found or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const version = await api.getPromptVersion('architect.system', 'version-uuid');
+   * console.log(`Content: ${version.content}`);
+   * ```
+   */
+  async getPromptVersion(
+    promptId: string,
+    versionId: string
+  ): Promise<VersionDetail> {
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/prompts/${promptId}/versions/${versionId}`
+    );
+    return handleResponse<VersionDetail>(response);
+  },
+
+  /**
+   * Create a new version (becomes active immediately).
+   *
+   * @param promptId - The unique identifier of the prompt.
+   * @param content - The new prompt content.
+   * @param changeNote - Optional note describing the changes.
+   * @returns The created version details.
+   * @throws {ApiError} When the prompt is not found or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const version = await api.createPromptVersion(
+   *   'architect.system',
+   *   'New prompt content...',
+   *   'Updated to include security considerations'
+   * );
+   * console.log(`Created version ${version.version_number}`);
+   * ```
+   */
+  async createPromptVersion(
+    promptId: string,
+    content: string,
+    changeNote: string | null
+  ): Promise<VersionDetail> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/prompts/${promptId}/versions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, change_note: changeNote }),
+    });
+    return handleResponse<VersionDetail>(response);
+  },
+
+  /**
+   * Reset prompt to hardcoded default.
+   *
+   * @param promptId - The unique identifier of the prompt.
+   * @returns Promise that resolves when the reset is successful.
+   * @throws {ApiError} When the prompt is not found or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * await api.resetPromptToDefault('architect.system');
+   * console.log('Prompt reset to default');
+   * ```
+   */
+  async resetPromptToDefault(promptId: string): Promise<void> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/prompts/${promptId}/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    await handleResponse(response);
+  },
+
+  /**
+   * Get the hardcoded default content for a prompt.
+   *
+   * @param promptId - The unique identifier of the prompt.
+   * @returns The default content for the prompt.
+   * @throws {ApiError} When the prompt is not found or the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const defaultContent = await api.getPromptDefault('architect.system');
+   * console.log(`Default content: ${defaultContent.content}`);
+   * ```
+   */
+  async getPromptDefault(promptId: string): Promise<DefaultContent> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/prompts/${promptId}/default`);
+    return handleResponse<DefaultContent>(response);
+  },
+
+  // ==========================================================================
+  // Config API
+  // ==========================================================================
+
+  /**
+   * Retrieves server configuration for dashboard.
+   *
+   * @returns Server configuration including repo_root and max_concurrent.
+   * @throws {ApiError} When the API request fails.
+   *
+   * @example
+   * ```typescript
+   * const config = await api.getConfig();
+   * console.log(`Working dir: ${config.repo_root}`);
+   * ```
+   */
+  async getConfig(): Promise<ConfigResponse> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/config`);
+    return handleResponse<ConfigResponse>(response);
+  },
+
+  // ==========================================================================
+  // Files API
+  // ==========================================================================
+
+  /**
+   * Reads file content for design document import.
+   *
+   * @param path - Absolute path to the file to read.
+   * @param worktreePath - Optional worktree path to use as base directory. If not provided, uses active profile's repo_root.
+   * @returns File content and filename.
+   * @throws {ApiError} When file not found, path invalid, or API request fails.
+   *
+   * @example
+   * ```typescript
+   * const file = await api.readFile('/path/to/design.md', '/path/to/worktree');
+   * console.log(`Content: ${file.content}`);
+   * ```
+   */
+  async readFile(path: string, worktreePath?: string): Promise<FileReadResponse> {
+    const params = new URLSearchParams();
+    if (worktreePath) {
+      params.append('worktree_path', worktreePath);
+    }
+    const url = params.toString()
+      ? `${API_BASE_URL}/files/read?${params}`
+      : `${API_BASE_URL}/files/read`;
+    const response = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    return handleResponse<FileReadResponse>(response);
+  },
+
+  // ==========================================================================
+  // Path Validation API
+  // ==========================================================================
+
+  /**
+   * Validates a filesystem path and returns git repository info.
+   *
+   * @param path - Absolute path to validate.
+   * @param signal - Optional AbortSignal to cancel the request.
+   * @returns Validation result with exists, is_git_repo, branch info.
+   * @throws {ApiError} When API request fails.
+   *
+   * @example
+   * ```typescript
+   * const result = await api.validatePath('/Users/me/my-repo');
+   * if (result.is_git_repo) {
+   *   console.log(`On branch: ${result.branch}`);
+   * }
+   * ```
+   */
+  async validatePath(path: string, signal?: AbortSignal): Promise<PathValidationResponse> {
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/paths/validate`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      },
+      signal
+    );
+    return handleResponse<PathValidationResponse>(response);
+  },
+
+  // ==========================================================================
+  // Usage API
+  // ==========================================================================
+
+  /**
+   * Retrieves usage metrics for a date range.
+   *
+   * @param params - Query parameters (preset or start/end dates).
+   * @returns UsageResponse with summary, trend, and by_model.
+   * @throws {ApiError} When the API request fails.
+   *
+   * @example
+   * ```typescript
+   * // With preset
+   * const usage = await api.getUsage({ preset: '30d' });
+   *
+   * // With date range
+   * const usage = await api.getUsage({ start: '2026-01-01', end: '2026-01-15' });
+   * ```
+   */
+  async getUsage(params: {
+    start?: string;
+    end?: string;
+    preset?: string;
+  }): Promise<UsageResponse> {
+    const searchParams = new URLSearchParams();
+
+    if (params.start && params.end) {
+      searchParams.set('start', params.start);
+      searchParams.set('end', params.end);
+    } else {
+      searchParams.set('preset', params.preset ?? '30d');
+    }
+
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/usage?${searchParams.toString()}`
+    );
+    return handleResponse<UsageResponse>(response);
+  },
+
+  // ==========================================================================
+  // Knowledge API
+  // ==========================================================================
+
+  /**
+   * List all knowledge documents.
+   *
+   * @returns Array of knowledge documents.
+   * @throws {ApiError} When the API request fails.
+   */
+  async getKnowledgeDocuments(): Promise<KnowledgeDocument[]> {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/knowledge/documents`);
+    const data = await handleResponse<KnowledgeDocumentListResponse>(response);
+    return data.documents;
+  },
+
+  /**
+   * Upload a document for ingestion.
+   *
+   * @param file - File to upload (PDF or Markdown).
+   * @param name - Document display name.
+   * @param tags - Tags for filtering.
+   * @returns Created document with pending status.
+   * @throws {ApiError} When upload fails or file type unsupported.
+   */
+  async uploadKnowledgeDocument(
+    file: File,
+    name: string,
+    tags: string[]
+  ): Promise<KnowledgeDocument> {
+    // Validate tags don't contain commas
+    const invalidTag = tags.find(tag => tag.includes(','));
+    if (invalidTag) {
+      throw new ApiError(`Tag "${invalidTag}" cannot contain commas`, 'VALIDATION_ERROR', 400);
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('name', name);
+    formData.append('tags', tags.join(','));
+
+    const response = await fetchWithTimeout(`${API_BASE_URL}/knowledge/documents`, {
+      method: 'POST',
+      body: formData,
+    });
+    return handleResponse<KnowledgeDocument>(response);
+  },
+
+  /**
+   * Delete a knowledge document.
+   *
+   * @param documentId - Document UUID.
+   * @throws {ApiError} When document not found or API request fails.
+   */
+  async deleteKnowledgeDocument(documentId: string): Promise<void> {
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/knowledge/documents/${documentId}`,
+      { method: 'DELETE' }
+    );
+    await handleResponse(response);
+  },
+
+  /**
+   * Search knowledge documents.
+   *
+   * @param query - Natural language search query.
+   * @param topK - Maximum results (default 5).
+   * @param tags - Optional tags to filter.
+   * @returns Ranked search results.
+   * @throws {ApiError} When search fails.
+   */
+  async searchKnowledge(
+    query: string,
+    topK: number = 5,
+    tags?: string[],
+    signal?: AbortSignal
+  ): Promise<SearchResult[]> {
+    if (signal?.aborted) {
+      throw new DOMException('Request aborted', 'AbortError');
+    }
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/knowledge/search`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, top_k: topK, tags }),
+      },
+      signal
+    );
+    return handleResponse<SearchResult[]>(response);
+  },
+
+  // ==========================================================================
+  // Review API
+  // ==========================================================================
+
+  /**
+   * Requests an on-demand code review for a workflow.
+   *
+   * @param workflowId - The unique identifier of the workflow.
+   * @param request - Review request with mode and review types.
+   * @returns Promise that resolves when the review is queued.
+   * @throws {ApiError} When the workflow is not found or the API request fails.
+   */
+  async requestReview(
+    workflowId: string,
+    request: RequestReviewRequest
+  ): Promise<void> {
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/workflows/${workflowId}/review`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      }
+    );
+    await handleResponse<void>(response);
+  },
+
+  // ==========================================================================
+  // PR Auto-Fix Metrics API
+  // ==========================================================================
+
+  /**
+   * Retrieves PR auto-fix metrics for a date range.
+   *
+   * @param params - Query parameters (preset or start/end dates, optional filters).
+   * @returns PRAutoFixMetricsResponse with summary, daily, and by_aggressiveness.
+   * @throws {ApiError} When the API request fails.
+   */
+  async getAutoFixMetrics(params: {
+    start?: string;
+    end?: string;
+    preset?: string;
+    profile?: string;
+    aggressiveness?: string;
+  }): Promise<PRAutoFixMetricsResponse> {
+    const searchParams = new URLSearchParams();
+
+    if (params.start) searchParams.set('start', params.start);
+    if (params.end) searchParams.set('end', params.end);
+    if (params.preset) searchParams.set('preset', params.preset);
+    if (params.profile) searchParams.set('profile', params.profile);
+    if (params.aggressiveness) searchParams.set('aggressiveness', params.aggressiveness);
+
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/github/pr-autofix/metrics?${searchParams.toString()}`
+    );
+    return handleResponse<PRAutoFixMetricsResponse>(response);
+  },
+
+  /**
+   * Retrieves paginated classification audit log.
+   *
+   * @param params - Query parameters (preset or start/end dates, pagination).
+   * @returns ClassificationsResponse with classifications list and total count.
+   * @throws {ApiError} When the API request fails.
+   */
+  async getClassifications(params: {
+    start?: string;
+    end?: string;
+    preset?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<ClassificationsResponse> {
+    const searchParams = new URLSearchParams();
+
+    if (params.start) searchParams.set('start', params.start);
+    if (params.end) searchParams.set('end', params.end);
+    if (params.preset) searchParams.set('preset', params.preset);
+    if (params.limit !== undefined) searchParams.set('limit', String(params.limit));
+    if (params.offset !== undefined) searchParams.set('offset', String(params.offset));
+
+    const response = await fetchWithTimeout(
+      `${API_BASE_URL}/github/pr-autofix/classifications?${searchParams.toString()}`
+    );
+    return handleResponse<ClassificationsResponse>(response);
+  },
+};
+
+export { ApiError };

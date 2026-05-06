@@ -1,0 +1,280 @@
+"""Integration tests for orchestrator prompt injection.
+
+Tests that prompts flow from orchestrator config through to agents.
+"""
+from pathlib import Path
+from typing import Any, cast
+from unittest.mock import patch
+from uuid import uuid4
+
+import pytest
+from langchain_core.runnables.config import RunnableConfig
+
+from amelia.agents.schemas.evaluator import Disposition, EvaluatedItem, EvaluationOutput
+from amelia.core.types import ReviewResult
+from amelia.drivers.base import AgenticMessage, AgenticMessageType
+from amelia.pipelines.implementation.nodes import call_architect_node
+from amelia.pipelines.nodes import call_developer_node, call_reviewer_node
+from amelia.pipelines.review.nodes import call_evaluation_node
+from tests.conftest import create_mock_execute_agentic
+from tests.integration.conftest import (
+    make_config,
+    make_execution_state,
+    make_issue,
+    make_profile,
+    make_reviewer_agentic_messages,
+)
+
+
+@pytest.fixture(autouse=True)
+def _mock_api_key(mock_api_key: None) -> None:
+    """Use shared mock_api_key fixture (autouse wrapper)."""
+
+
+@pytest.mark.integration
+class TestOrchestratorPromptInjection:
+    """Tests for prompt injection through orchestrator nodes."""
+
+    async def test_architect_uses_injected_prompt_via_driver(self, tmp_path: Path) -> None:
+        """Verify Architect uses injected prompt when calling driver.
+
+        This test patches at the driver level to verify the prompt flows through.
+        The architect now uses execute_agentic which takes instructions parameter.
+        """
+        plans_dir = tmp_path / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+
+        custom_plan_prompt = "Custom plan prompt from config..."
+        prompts = {"architect.plan": custom_plan_prompt}
+
+        profile = make_profile(
+            plan_output_dir=str(plans_dir),
+            repo_root=str(tmp_path),
+        )
+        issue = make_issue(id="TEST-1", title="Test feature")
+        state = make_execution_state(issue=issue, profile=profile)
+        config = make_config(thread_id=str(uuid4()), profile=profile, prompts=prompts)
+
+        # The architect now uses execute_agentic which yields AgenticMessage events
+        plan_content = "**Goal:** Test goal\n\n# Test Plan"
+        mock_messages = [
+            AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content=plan_content,
+                session_id="session-1",
+            ),
+        ]
+        captured_kwargs: list[dict[str, Any]] = []
+        mock_execute = create_mock_execute_agentic(mock_messages, captured_kwargs)
+
+        # Patch at driver.execute_agentic level to check instructions
+        with patch("amelia.drivers.api.deepagents.ApiDriver.execute_agentic", mock_execute):
+            await call_architect_node(state, cast(RunnableConfig, config))
+
+            # Verify the custom prompt was used via instructions param
+            assert len(captured_kwargs) == 1
+            assert captured_kwargs[0].get("instructions") == custom_plan_prompt
+
+    async def test_reviewer_uses_injected_prompt_via_driver(self, tmp_path: Path) -> None:
+        """Verify Reviewer uses injected prompt when calling driver.
+
+        This test patches at the driver level to verify the prompt flows through.
+        The reviewer node uses agentic_review() which uses execute_agentic with instructions.
+        """
+        custom_agentic_prompt = "Custom agentic review prompt with {base_commit}..."
+        prompts = {"reviewer.agentic": custom_agentic_prompt}
+
+        profile = make_profile(repo_root=str(tmp_path))
+        state = make_execution_state(
+            profile=profile,
+            goal="Test goal",
+            code_changes_for_review="diff content",
+            base_commit="abc123",
+        )
+        config = make_config(thread_id=str(uuid4()), profile=profile, prompts=prompts)
+
+        mock_messages = make_reviewer_agentic_messages(approved=True)
+        captured_kwargs: list[dict[str, Any]] = []
+
+        async def mock_execute_agentic(*args: Any, **kwargs: Any) -> Any:
+            captured_kwargs.append(kwargs)
+            for msg in mock_messages:
+                yield msg
+
+        # Patch at driver.execute_agentic level to check instructions
+        with patch("amelia.drivers.api.deepagents.ApiDriver.execute_agentic", mock_execute_agentic):
+            await call_reviewer_node(state, cast(RunnableConfig, config))
+
+            # Verify the custom prompt was used (formatted with base_commit)
+            assert len(captured_kwargs) == 1
+            # The prompt should be formatted with base_commit
+            assert captured_kwargs[0]["instructions"] == "Custom agentic review prompt with abc123..."
+
+    async def test_developer_uses_injected_system_prompt_via_driver(self, tmp_path: Path) -> None:
+        """Verify Developer uses injected system prompt when calling driver."""
+        custom_developer_prompt = "Custom Amelia developer system prompt"
+        prompts = {"developer.system": custom_developer_prompt}
+
+        profile = make_profile(repo_root=str(tmp_path))
+        state = make_execution_state(
+            profile=profile,
+            goal="Implement feature",
+            plan_markdown="# Plan\n\n## Phase 1\n\n### Task 1: Build\n\nDo it.",
+        )
+        config = make_config(thread_id=str(uuid4()), profile=profile, prompts=prompts)
+
+        mock_messages = [
+            AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content="Completed",
+                session_id="session-dev-1",
+            ),
+        ]
+        captured_kwargs: list[dict[str, Any]] = []
+        mock_execute = create_mock_execute_agentic(mock_messages, captured_kwargs)
+
+        with patch("amelia.drivers.api.deepagents.ApiDriver.execute_agentic", mock_execute):
+            await call_developer_node(state, cast(RunnableConfig, config))
+
+            assert len(captured_kwargs) == 1
+            assert captured_kwargs[0]["instructions"] == custom_developer_prompt
+
+    async def test_prompts_not_in_config_uses_defaults(self, tmp_path: Path) -> None:
+        """When prompts not in config, agents should use class defaults.
+
+        This ensures backward compatibility - existing workflows without
+        prompts in config continue to work with default prompts.
+        """
+        plans_dir = tmp_path / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+
+        profile = make_profile(
+            plan_output_dir=str(plans_dir),
+            repo_root=str(tmp_path),
+        )
+        issue = make_issue(id="TEST-1", title="Test feature")
+        state = make_execution_state(issue=issue, profile=profile)
+        # No prompts in config
+        config = make_config(thread_id=str(uuid4()), profile=profile)
+
+        # The architect uses execute_agentic which takes instructions parameter
+        plan_content = "**Goal:** Test goal\n\n# Test Plan"
+        mock_messages = [
+            AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content=plan_content,
+                session_id="session-1",
+            ),
+        ]
+        captured_kwargs: list[dict[str, Any]] = []
+        mock_execute = create_mock_execute_agentic(mock_messages, captured_kwargs)
+
+        with patch("amelia.drivers.api.deepagents.ApiDriver.execute_agentic", mock_execute):
+            await call_architect_node(state, cast(RunnableConfig, config))
+
+            # Verify a non-empty default prompt was used
+            assert len(captured_kwargs) == 1
+            instructions = captured_kwargs[0].get("instructions")
+            assert instructions is not None
+            assert len(instructions) > 50
+
+    async def test_empty_prompts_dict_uses_defaults(self, tmp_path: Path) -> None:
+        """Empty prompts dict in config should use agent defaults."""
+        plans_dir = tmp_path / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+
+        profile = make_profile(
+            plan_output_dir=str(plans_dir),
+            repo_root=str(tmp_path),
+        )
+        issue = make_issue(id="TEST-1", title="Test feature")
+        state = make_execution_state(issue=issue, profile=profile)
+        # Empty prompts dict
+        config = make_config(thread_id=str(uuid4()), profile=profile, prompts={})
+
+        # The architect uses execute_agentic which takes instructions parameter
+        plan_content = "**Goal:** Test goal\n\n# Test Plan"
+        mock_messages = [
+            AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content=plan_content,
+                session_id="session-1",
+            ),
+        ]
+        captured_kwargs: list[dict[str, Any]] = []
+        mock_execute = create_mock_execute_agentic(mock_messages, captured_kwargs)
+
+        with patch("amelia.drivers.api.deepagents.ApiDriver.execute_agentic", mock_execute):
+            await call_architect_node(state, cast(RunnableConfig, config))
+
+            # Verify a non-empty default prompt was used
+            assert len(captured_kwargs) == 1
+            instructions = captured_kwargs[0].get("instructions")
+            assert instructions is not None
+            assert len(instructions) > 50
+
+    async def test_evaluator_uses_injected_prompt_via_driver(self, tmp_path: Path) -> None:
+        """Verify Evaluator uses injected prompt when calling driver.
+
+        This test patches at the driver level to verify the prompt flows through.
+        """
+        custom_system_prompt = "Custom evaluator system prompt..."
+        prompts = {"evaluator.system": custom_system_prompt}
+
+        profile = make_profile(repo_root=str(tmp_path))
+        # Evaluator requires last_reviews with comments
+        review_result = ReviewResult(
+            reviewer_persona="General",
+            approved=False,
+            comments=["Issue 1: Check this function"],
+            severity="minor",
+        )
+        state = make_execution_state(
+            profile=profile,
+            goal="Test goal",
+            code_changes_for_review="diff content",
+            last_reviews=[review_result],
+        )
+        config = make_config(thread_id=str(uuid4()), profile=profile, prompts=prompts)
+
+        evaluation_output = EvaluationOutput(
+            evaluated_items=[
+                EvaluatedItem(
+                    number=1,
+                    title="Check function",
+                    file_path="test.py",
+                    line=10,
+                    disposition=Disposition.IMPLEMENT,
+                    reason="Valid issue",
+                    original_issue="Issue 1: Check this function",
+                    suggested_fix="Fix the function",
+                ),
+            ],
+            summary="Evaluation complete",
+        )
+
+        captured_kwargs: list[dict[str, Any]] = []
+
+        async def mock_execute_agentic(*args: Any, **kwargs: Any) -> Any:
+            captured_kwargs.append(kwargs)
+            yield AgenticMessage(
+                type=AgenticMessageType.TOOL_CALL,
+                tool_name="submit_evaluation",
+                tool_input=evaluation_output.model_dump(),
+                tool_call_id="eval-1",
+                session_id="session-1",
+            )
+            yield AgenticMessage(
+                type=AgenticMessageType.RESULT,
+                content="Evaluation complete",
+                session_id="session-1",
+            )
+
+        # Patch at driver.execute_agentic level to check instructions
+        with patch("amelia.drivers.api.deepagents.ApiDriver.execute_agentic", mock_execute_agentic):
+            await call_evaluation_node(state, cast(RunnableConfig, config))
+
+            # Verify the custom prompt was passed as instructions
+            assert len(captured_kwargs) == 1
+            assert captured_kwargs[0].get("instructions") == custom_system_prompt
+

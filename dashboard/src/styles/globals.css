@@ -1,0 +1,398 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+/*
+ ---break---
+ */
+@custom-variant dark (&:is(.dark *));
+@custom-variant touch (@media (hover: none));
+
+/*
+ * ============================================================================
+ * DESIGN TOKENS
+ * ============================================================================
+ * All colors use CSS variables for consistent theming.
+ * Components reference these via Tailwind classes: bg-background, text-primary, etc.
+ *
+ * Note: ai-elements components use these same CSS variables, so the theme
+ * automatically applies to queue, canvas, node, edge, and other
+ * ai-elements components without additional configuration.
+ *
+ * TAILWIND v4: Uses @theme inline directive to map CSS vars to utilities.
+ * This replaces the traditional tailwind.config.js extend colors approach.
+ */
+
+@theme inline {
+  /* Map CSS custom properties to Tailwind utilities */
+  /* Usage: bg-background, text-foreground, bg-primary, etc. */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+
+  /* Session selection states */
+  --color-session-selected: var(--session-selected);
+  --color-session-selected-foreground: var(--session-selected-foreground);
+  --color-session-hover: var(--session-hover);
+  --color-session-active-border: var(--session-active-border);
+
+  /* Status colors for workflow badges */
+  --color-status-running: var(--status-running);
+  --color-status-completed: var(--status-completed);
+  --color-status-pending: var(--status-pending);
+  --color-status-blocked: var(--status-blocked);
+  --color-status-failed: var(--status-failed);
+  --color-status-cancelled: var(--status-cancelled);
+
+  /* Agent-specific colors for activity logs and usage tables */
+  --color-agent-pm: var(--agent-pm);
+  --color-agent-architect: var(--agent-architect);
+  --color-agent-developer: var(--agent-developer);
+  --color-agent-reviewer: var(--agent-reviewer);
+
+  /* Agent background tints (subtle row highlights) */
+  --color-agent-pm-bg: var(--agent-pm-bg);
+  --color-agent-architect-bg: var(--agent-architect-bg);
+  --color-agent-developer-bg: var(--agent-developer-bg);
+  --color-agent-reviewer-bg: var(--agent-reviewer-bg);
+
+  /* Multi-model chart palette */
+  --color-chart-model-1: var(--chart-model-1);
+  --color-chart-model-2: var(--chart-model-2);
+  --color-chart-model-3: var(--chart-model-3);
+  --color-chart-model-4: var(--chart-model-4);
+  --color-chart-model-5: var(--chart-model-5);
+  --color-chart-model-6: var(--chart-model-6);
+  --color-cost-value: var(--cost-value);
+
+  /* Border radius scale */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+
+  /* Font families */
+  --font-display: "Bebas Neue", sans-serif;
+  --font-heading: "Barlow Condensed", sans-serif;
+  --font-body: "Source Sans 3", sans-serif;
+  --font-mono: "IBM Plex Mono", monospace;
+
+  /* Animation durations */
+  --duration-fast: 150ms;
+  --duration-normal: 200ms;
+  --duration-slow: 300ms;
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+/*
+ * Base Theme - Dark Forest Green Aesthetic
+ * Note: This defines the default/base theme with a dark forest green color palette
+ */
+:root {
+  /* Core backgrounds */
+  --background: oklch(8% 0.02 150);           /* #0D1A12 - Deep dark green */
+  --foreground: oklch(95% 0.02 120);          /* #EFF8E2 - Warm off-white */
+
+  /* Card/surface backgrounds */
+  --card: oklch(18% 0.025 150);               /* #1F332E - Elevated surface */
+  --card-foreground: oklch(95% 0.02 120);
+
+  /* Popover/dropdown backgrounds */
+  --popover: oklch(18% 0.025 150);
+  --popover-foreground: oklch(95% 0.02 120);
+
+  /* Primary accent - Gold */
+  --primary: oklch(82% 0.16 85);              /* #FFC857 - Gold */
+  --primary-foreground: oklch(8% 0.02 150);   /* Dark text on gold */
+
+  /* Secondary - Muted green */
+  --secondary: oklch(35% 0.04 150);           /* #4A5C54 - Muted panel */
+  --secondary-foreground: oklch(95% 0.02 120);
+
+  /* Muted text and labels */
+  --muted: oklch(25% 0.03 150);
+  --muted-foreground: oklch(60% 0.05 150);    /* #88A896 - Secondary text */
+
+  /* Accent - Blue for links/interactive */
+  --accent: oklch(65% 0.12 240);              /* #5B9BD5 - Blue accent */
+  --accent-foreground: oklch(95% 0.02 120);
+
+  /* Destructive/error states */
+  --destructive: oklch(50% 0.2 25);           /* #A33D2E - Deep red */
+  --destructive-foreground: oklch(95% 0.02 120);
+
+  /* Border and input colors */
+  --border: oklch(30% 0.02 150 / 0.2);
+  --input: oklch(30% 0.02 150 / 0.3);
+  --ring: oklch(82% 0.16 85 / 0.5);           /* Gold ring */
+
+  /* Status colors */
+  --status-running: oklch(82% 0.16 85);       /* Gold - in progress */
+  --status-completed: oklch(50% 0.1 150);     /* #5B8A72 - Green done */
+  --status-pending: oklch(35% 0.04 150);      /* Gray - queued */
+  --status-blocked: oklch(50% 0.2 25);        /* Red - awaiting */
+  --status-failed: oklch(50% 0.2 25);         /* Red - error */
+  --status-cancelled: oklch(45% 0.03 250);    /* Muted blue-gray - cancelled */
+
+  /* Sidebar specific */
+  --sidebar: oklch(12% 0.02 150);
+  --sidebar-foreground: oklch(95% 0.02 120);
+  --sidebar-primary: oklch(82% 0.16 85);
+  --sidebar-primary-foreground: oklch(8% 0.02 150);
+  --sidebar-accent: oklch(25% 0.03 150);
+  --sidebar-accent-foreground: oklch(95% 0.02 120);
+  --sidebar-border: oklch(30% 0.02 150 / 0.15);
+
+  /* Chart colors for data visualization */
+  --chart-1: oklch(82% 0.16 85);              /* Gold */
+  --chart-2: oklch(50% 0.1 150);              /* Green */
+  --chart-3: oklch(65% 0.12 240);             /* Blue */
+  --chart-4: oklch(50% 0.2 25);               /* Red */
+  --chart-5: oklch(60% 0.05 150);             /* Gray */
+
+  /* Multi-model chart palette (ordered by cost rank) */
+  --chart-model-1: oklch(72% 0.14 195);       /* Teal - highest cost */
+  --chart-model-2: oklch(68% 0.12 280);       /* Violet */
+  --chart-model-3: oklch(70% 0.10 45);        /* Coral */
+  --chart-model-4: oklch(65% 0.13 160);       /* Mint */
+  --chart-model-5: oklch(60% 0.08 230);       /* Steel Blue */
+  --chart-model-6: oklch(65% 0.10 330);       /* Dusty Rose */
+
+  /* Cost-specific (demoted from gold for table values) */
+  --cost-value: oklch(75% 0.08 90);           /* Warm cream */
+
+  --sidebar-ring: oklch(62% 0.214 259);
+
+  /* Session selection states (forest-native, avoids jarring blue) */
+  --session-selected: oklch(22% 0.025 150);
+  --session-selected-foreground: oklch(95% 0.02 120);
+  --session-hover: oklch(16% 0.025 150);
+  --session-active-border: var(--primary);
+
+  /* Agent-specific colors */
+  --agent-pm: oklch(65% 0.15 290);            /* Violet */
+  --agent-architect: oklch(65% 0.12 240);     /* Blue (same as accent) */
+  --agent-developer: oklch(82% 0.16 85);      /* Gold (same as primary) */
+  --agent-reviewer: oklch(50% 0.1 150);       /* Green (same as status-completed) */
+
+  /* Agent background tints (subtle, ~8% opacity) */
+  --agent-pm-bg: oklch(65% 0.15 290 / 0.08);
+  --agent-architect-bg: oklch(65% 0.12 240 / 0.08);
+  --agent-developer-bg: oklch(82% 0.16 85 / 0.08);
+  --agent-reviewer-bg: oklch(50% 0.1 150 / 0.08);
+}
+
+/*
+ * Base styles
+ */
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    font-family: var(--font-body);
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+
+  /* Typography utilities */
+  .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-heading {
+    font-family: var(--font-heading);
+  }
+
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  /* Custom scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: oklch(from var(--background) l c h);
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: oklch(from var(--muted-foreground) l c h / 0.5);
+    border-radius: var(--radius-sm);
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: oklch(from var(--primary) l c h);
+  }
+
+  /* Hide React Flow attribution watermark */
+  .react-flow__attribution {
+    display: none;
+  }
+
+  /* Style React Flow controls to match theme */
+  .react-flow__controls {
+    --xy-controls-button-background-color: var(--card);
+    --xy-controls-button-background-color-hover: var(--secondary);
+    --xy-controls-button-color: var(--muted-foreground);
+    --xy-controls-button-color-hover: var(--primary);
+    --xy-controls-button-border-color: var(--border);
+    --xy-controls-box-shadow: none;
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+
+  .react-flow__controls-button {
+    border-color: var(--border) !important;
+  }
+
+  .react-flow__controls-button:hover {
+    background-color: var(--secondary) !important;
+  }
+
+  .react-flow__controls-button svg {
+    fill: currentColor;
+  }
+}
+
+/*
+ * Component utilities
+ */
+@layer components {
+  /* Focus ring utility */
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background;
+  }
+
+  /* Assistant message bubble with gradient left accent */
+  .assistant-bubble {
+    position: relative;
+    background-color: var(--card);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+  }
+
+  .assistant-bubble::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: linear-gradient(
+      to bottom,
+      oklch(62% 0.12 150),
+      oklch(58% 0.16 290)
+    );
+    border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+  }
+
+  /* Modal panel styling with top accent */
+  .modal-panel {
+    position: relative;
+    background-color: var(--background);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 0 0 1px oklch(from var(--border) l c h / 0.5);
+  }
+
+  .modal-panel::before {
+    content: "";
+    position: absolute;
+    inset-inline: 0;
+    top: 0;
+    height: 1px;
+    background: linear-gradient(
+      to right,
+      transparent,
+      oklch(from var(--primary) l c h / 0.6),
+      transparent
+    );
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  }
+}
+
+/*
+ * Animation keyframes
+ */
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 8px oklch(from var(--primary) l c h / 0.6));
+  }
+  50% {
+    opacity: 0.7;
+    filter: drop-shadow(0 0 16px oklch(from var(--primary) l c h / 0.8));
+  }
+}
+
+@keyframes beacon-glow {
+  0%, 100% {
+    filter: drop-shadow(0 0 4px oklch(from var(--primary) l c h / 0.6));
+  }
+  50% {
+    filter: drop-shadow(0 0 16px oklch(from var(--primary) l c h / 0.9));
+  }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes progress-pulse {
+  0%, 100% { width: 30%; }
+  50% { width: 60%; }
+}
+
+@layer utilities {
+  .animate-pulse-glow {
+    animation: pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  .animate-beacon-glow {
+    animation: beacon-glow 2s ease-in-out infinite;
+  }
+
+  .animate-blink {
+    animation: blink 1s step-end infinite;
+  }
+}
+
+/*
+ * Accessibility: Respect user preferences for reduced motion
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

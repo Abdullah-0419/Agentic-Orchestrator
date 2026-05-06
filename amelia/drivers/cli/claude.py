@@ -1,0 +1,812 @@
+"""Claude CLI driver using the claude-agent-sdk.
+
+This driver wraps the Claude CLI via the official claude-agent-sdk package,
+providing both single-turn generation and agentic execution capabilities.
+"""
+import json
+import re
+from collections.abc import AsyncIterator
+from typing import Any, Literal
+
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ProcessError,
+    create_sdk_mcp_server,
+    query,
+    tool as sdk_tool,
+)
+from claude_agent_sdk._errors import MessageParseError  # private API, pinned to >=0.1.38
+from claude_agent_sdk._internal.message_parser import parse_message as _sdk_parse_message
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    Message,
+    ResultMessage,
+    StreamEvent as SDKStreamEvent,
+    SystemPromptPreset,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+from loguru import logger
+from pydantic import BaseModel, ValidationError
+
+from amelia.core.constants import CANONICAL_TO_CLI, normalize_tool_name
+from amelia.core.exceptions import ModelProviderError, SchemaValidationError
+from amelia.drivers.base import (
+    AgenticMessage,
+    AgenticMessageType,
+    DriverInterface,
+    DriverUsage,
+    GenerateResult,
+    SubmitToolDef,
+)
+from amelia.drivers.cli.utils import strip_markdown_fences
+from amelia.logging import log_claude_result
+
+
+# Claude Code sets CLAUDECODE and CLAUDE_CODE_ENTRYPOINT in its shell env.
+# If a developer runs Amelia from inside Claude Code, these vars leak into
+# the SDK subprocess, which thinks it's a nested Claude Code session and
+# immediately exits with code 1.
+#
+# We blank them explicitly because the SDK merges options.env on top of
+# os.environ — omitting a key doesn't remove it.
+_NESTED_SESSION_OVERRIDES = {"CLAUDECODE": "", "CLAUDE_CODE_ENTRYPOINT": ""}
+
+
+def _build_sanitized_env() -> dict[str, str]:
+    """Return env overrides that neutralise nested-session guard vars.
+
+    The claude-agent-sdk merges these on top of os.environ, so we return
+    only the keys that need overriding rather than a full copy of the env.
+    """
+    return dict(_NESTED_SESSION_OVERRIDES)
+
+
+# Patterns that match common secret formats in CLI stderr output.
+_SECRET_PATTERNS: list[re.Pattern[str]] = [
+    # API keys: sk-ant-*, sk-*, key-*, etc.
+    re.compile(r"\b(sk-ant-[A-Za-z0-9_-]{10,})", re.IGNORECASE),
+    re.compile(r"\b(sk-[A-Za-z0-9_-]{20,})", re.IGNORECASE),
+    re.compile(r"\b(key-[A-Za-z0-9_-]{20,})", re.IGNORECASE),
+    # Bearer / token headers
+    re.compile(r"(Bearer\s+[A-Za-z0-9_.~+/=-]{10,})", re.IGNORECASE),
+    re.compile(r"(token[=: ]+[A-Za-z0-9_.~+/=-]{10,})", re.IGNORECASE),
+    # Session IDs (hex or UUID-like)
+    re.compile(r"(session[_-]?id[=: ]+[A-Za-z0-9_-]{8,})", re.IGNORECASE),
+    # Generic long hex strings (40+ chars, e.g. SHA tokens)
+    re.compile(r"\b([0-9a-f]{40,})\b", re.IGNORECASE),
+    # x-api-key header values
+    re.compile(r"(x-api-key[=: ]+[A-Za-z0-9_.~+/=-]{10,})", re.IGNORECASE),
+]
+
+
+def _sanitize_stderr(stderr: str, max_len: int = 1000) -> str:
+    """Return a redacted, size-limited stderr snippet safe for logs.
+
+    Redacts API keys, tokens, session IDs, and other secret-like patterns
+    before truncating, so credentials are never exposed in logs or exceptions.
+    """
+    snippet = stderr.replace("\n", " ").strip()
+    redacted = False
+    for pattern in _SECRET_PATTERNS:
+        snippet, count = pattern.subn("[REDACTED]", snippet)
+        if count:
+            redacted = True
+    if len(snippet) > max_len:
+        snippet = f"{snippet[:max_len]}…[truncated]"
+    elif redacted:
+        snippet = f"{snippet} [redacted]"
+    return snippet
+
+
+
+
+# Phrases that indicate Claude is asking for clarification rather than producing output
+_CLARIFICATION_PHRASES = [
+    "could you clarify",
+    "can you provide",
+    "i need more",
+    "please provide",
+    "before i can",
+    "to help me understand",
+    "i have a few questions",
+    "could you tell me",
+    "what type of",
+    "which approach",
+    "i need to know",
+    "can you tell me",
+    "i'd like to understand",
+    "could you explain",
+    "what is the",
+    "what are the",
+]
+
+
+def _is_clarification_request(text: str) -> bool:
+    """Detect if Claude is asking for clarification instead of producing output.
+
+    Checks for common clarification phrases and multiple question marks
+    to identify when Claude needs more information from the user.
+
+    Args:
+        text: The text response from Claude to analyze.
+
+    Returns:
+        True if the response appears to be requesting clarification, False otherwise.
+    """
+    text_lower = text.lower()
+
+    # Check for clarification phrases
+    if any(phrase in text_lower for phrase in _CLARIFICATION_PHRASES):
+        return True
+
+    # Multiple questions strongly suggest a clarification request
+    return text.count("?") >= 2
+
+
+def _log_sdk_message(message: Message | SDKStreamEvent) -> None:
+    """Log SDK message using the existing log_claude_result function.
+
+    Args:
+        message: Message or StreamEvent from claude-agent-sdk to log.
+    """
+    if isinstance(message, SDKStreamEvent):
+        # SDK StreamEvent contains progress updates, log at debug level
+        event_type = message.event.get("type", "unknown")
+        logger.debug(
+            "SDK StreamEvent received",
+            event_type=event_type,
+            session_id=message.session_id,
+        )
+        return
+
+    if isinstance(message, AssistantMessage):
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                log_claude_result(
+                    result_type="assistant",
+                    content=block.text,
+                )
+            elif isinstance(block, ToolUseBlock):
+                log_claude_result(
+                    result_type="tool_use",
+                    tool_name=block.name,
+                    tool_input=block.input,
+                )
+            elif isinstance(block, ToolResultBlock):
+                content = block.content if isinstance(block.content, str) else str(block.content)
+                log_claude_result(
+                    result_type="result",
+                    result_text=content,
+                    subtype="error" if block.is_error else "success",
+                )
+
+    elif isinstance(message, UserMessage):
+        # SDK delivers ToolResultBlock inside UserMessage
+        if isinstance(message.content, list):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    content = block.content if isinstance(block.content, str) else str(block.content)
+                    log_claude_result(
+                        result_type="result",
+                        result_text=content,
+                        subtype="error" if block.is_error else "success",
+                    )
+
+    elif isinstance(message, ResultMessage):
+        log_claude_result(
+            result_type="result",
+            session_id=message.session_id,
+            result_text=message.result,
+            subtype="error" if message.is_error else "success",
+            duration_ms=message.duration_ms,
+            num_turns=message.num_turns,
+            cost_usd=message.total_cost_usd,
+        )
+
+
+def _handle_parse_error(e: MessageParseError) -> None:
+    """Handle unparseable SDK messages, escalating rate-limit problems."""
+    data = e.data or {}
+    msg_type = data.get("type")
+
+    if msg_type == "rate_limit_event":
+        info = data.get("rate_limit_info", {})
+        status = info.get("status")
+        if status == "allowed":
+            logger.debug("Rate limit check passed", rate_limit_info=info)
+        else:
+            logger.warning(
+                "Rate limit restriction active",
+                status=status,
+                rate_limit_type=info.get("rateLimitType"),
+                resets_at=info.get("resetsAt"),
+                overage_status=info.get("overageStatus"),
+            )
+        return
+
+    logger.debug(
+        "Skipping unknown SDK message type",
+        error_message=str(e),
+        raw_data=data,
+    )
+
+
+
+async def _safe_receive_response(
+    client: ClaudeSDKClient,
+) -> AsyncIterator[Message | SDKStreamEvent]:
+    """Iterate over SDK messages, skipping unparseable ones without killing the stream.
+
+    The SDK's ``receive_messages()`` calls ``parse_message()`` inside an
+    async-generator body.  If ``parse_message`` raises ``MessageParseError``,
+    the generator is **permanently exhausted** (Python async-generator semantics).
+    That means our outer try/except never sees a second message — the stream dies.
+
+    This helper bypasses the problem by reading raw dicts from the transport
+    layer (``client._query.receive_messages()``) and calling ``parse_message``
+    ourselves *outside* the generator body.  Parse failures are logged and
+    skipped without killing the underlying stream.
+    """
+    # Access the internal query's raw message stream (yields plain dicts).
+    # We call parse_message ourselves so a failure doesn't kill the generator.
+    query_client = client._query
+    if query_client is None:
+        raise RuntimeError("Claude SDK query stream is unavailable")
+    raw_messages = query_client.receive_messages()
+    raw_iter = raw_messages.__aiter__()
+    try:
+        while True:
+            try:
+                raw = await raw_iter.__anext__()
+            except StopAsyncIteration:
+                break
+
+            try:
+                message = _sdk_parse_message(raw)
+            except MessageParseError as e:
+                _handle_parse_error(e)
+                continue
+
+            if message is None:
+                continue
+            yield message
+            if isinstance(message, ResultMessage):
+                return
+    finally:
+        aclose = getattr(raw_iter, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+
+class ClaudeCliDriver(DriverInterface):
+    """Claude CLI Driver using the claude-agent-sdk.
+
+    This driver wraps the Claude CLI via the official SDK, providing both
+    single-turn generation (via generate()) and autonomous agentic execution
+    (via execute_agentic()).
+
+    Attributes:
+        model: Claude model to use (sonnet, opus, haiku).
+        skip_permissions: Whether to bypass permission prompts.
+        tool_call_history: List of tool calls made during agentic execution.
+    """
+
+    def __init__(
+        self,
+        model: str = "sonnet",
+        skip_permissions: bool = False,
+        cwd: str | None = None,
+    ):
+        """Initialize the Claude CLI driver.
+
+        Args:
+            model: Claude model to use. Defaults to "sonnet".
+            skip_permissions: Skip permission prompts. Defaults to False.
+            cwd: Working directory for Claude CLI context. Defaults to None.
+        """
+        self.model = model
+        self.skip_permissions = skip_permissions
+        self.cwd = cwd
+        self.tool_call_history: list[ToolUseBlock] = []
+        self.last_result_message: ResultMessage | None = None
+
+    def _build_options(
+        self,
+        cwd: str | None = None,
+        session_id: str | None = None,
+        system_prompt: str | None = None,
+        schema: type[BaseModel] | None = None,
+        bypass_permissions: bool = False,
+        allowed_tools: list[str] | None = None,
+        mcp_servers: dict[str, Any] | None = None,
+    ) -> ClaudeAgentOptions:
+        """Build ClaudeAgentOptions from driver configuration.
+
+        Args:
+            cwd: Working directory for Claude CLI context.
+            session_id: Optional session ID to resume a previous conversation.
+            system_prompt: Optional system prompt to append.
+            schema: Optional Pydantic model for structured output.
+            bypass_permissions: Whether to bypass permission prompts for this call.
+            allowed_tools: Optional list of canonical tool names. Mapped to CLI SDK
+                names via CANONICAL_TO_CLI. Unknown names are passed through as-is
+                for custom/MCP tools.
+            mcp_servers: Optional dict of MCP server configurations to inject.
+                Passed directly to ClaudeAgentOptions.mcp_servers.
+
+        Returns:
+            Configured ClaudeAgentOptions instance.
+        """
+        # Determine permission mode
+        permission_mode: Literal["default", "acceptEdits", "plan", "bypassPermissions"] | None = None
+        if bypass_permissions or self.skip_permissions:
+            permission_mode = "bypassPermissions"
+
+        # Build output format for schema if provided
+        # Note: SDK expects "schema" key, not "json_schema"
+        output_format = None
+        if schema:
+            output_format = {
+                "type": "json_schema",
+                "schema": schema.model_json_schema(),
+            }
+
+        # When resuming a session, don't override the system prompt.
+        # The SDK passes `--system-prompt ""` when system_prompt is None, which
+        # replaces the original context. Using a preset without `append` tells
+        # the SDK to not pass any --system-prompt flag, preserving the original
+        # session's system prompt and conversation context.
+        effective_system_prompt: str | SystemPromptPreset | None = system_prompt
+        if session_id is not None:
+            # Resuming: use preset without append to skip --system-prompt flag
+            effective_system_prompt = SystemPromptPreset(type="preset", preset="claude_code")
+
+        # Map canonical tool names to CLI SDK names
+        cli_allowed_tools: list[str] | None = None
+        if allowed_tools is not None:
+            cli_allowed_tools = []
+            for name in allowed_tools:
+                cli_name = CANONICAL_TO_CLI.get(name, name)  # Unknown names pass through as-is
+                cli_allowed_tools.append(cli_name)
+
+        # Build options kwargs. The SDK defaults allowed_tools to [] (no restriction),
+        # so we only include it when the caller explicitly provided a list.
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "cwd": cwd,
+            "permission_mode": permission_mode,
+            "system_prompt": effective_system_prompt,
+            "resume": session_id,
+            "output_format": output_format,
+            "env": _build_sanitized_env(),
+        }
+        if cli_allowed_tools is not None:
+            if len(cli_allowed_tools) == 0:
+                logger.warning("allowed_tools resolved to empty list — agent will have no tools")
+            kwargs["allowed_tools"] = cli_allowed_tools
+
+        if mcp_servers is not None:
+            kwargs["mcp_servers"] = mcp_servers
+
+        return ClaudeAgentOptions(**kwargs)
+
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: str | None = None,
+        schema: type[BaseModel] | None = None,
+        **kwargs: Any,
+    ) -> GenerateResult:
+        """Generate a response using the claude-agent-sdk.
+
+        Args:
+            prompt: The user prompt to send to the model.
+            system_prompt: Optional system prompt for context/instructions.
+            schema: Optional Pydantic model for structured output.
+            **kwargs: Driver-specific parameters:
+                - session_id: Optional session ID to resume a previous conversation.
+                - cwd: Optional working directory for Claude CLI context.
+
+        Returns:
+            GenerateResult tuple of (output, session_id):
+            - output: str (if no schema) or instance of the schema
+            - session_id: str if returned from SDK, None otherwise
+
+        Raises:
+            RuntimeError: If Claude CLI fails or returns unexpected output.
+        """
+        session_id = kwargs.get("session_id")
+        cwd = kwargs.get("cwd") or self.cwd
+        session_id_result: str | None = None
+
+        options = self._build_options(
+            cwd=cwd,
+            session_id=session_id,
+            system_prompt=system_prompt,
+            schema=schema,
+        )
+
+        # Capture stderr lines for diagnostics on failure
+        stderr_lines: list[str] = []
+        options.stderr = lambda line: stderr_lines.append(line)
+
+        try:
+            # Collect all messages
+            result_message: ResultMessage | None = None
+            assistant_content: list[str] = []
+
+            # Manual iteration to catch MessageParseError from unknown SDK
+            # message types without aborting the stream.
+            _query = query(prompt=prompt, options=options).__aiter__()
+            try:
+                while True:
+                    try:
+                        message = await _query.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except MessageParseError as e:
+                        _handle_parse_error(e)
+                        continue
+                    _log_sdk_message(message)
+
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                assistant_content.append(block.text)
+
+                    elif isinstance(message, ResultMessage):
+                        result_message = message
+                        session_id_result = message.session_id
+                        # Store for token usage extraction
+                        self.last_result_message = message
+            finally:
+                aclose = getattr(_query, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+
+            if result_message is None:
+                raise RuntimeError("Claude SDK did not return a result message")
+
+            if result_message.is_error:
+                raise RuntimeError(f"Claude SDK reported error: {result_message.result}")
+
+            # Handle structured output
+            if schema:
+                # Try structured_output first (preferred for schema requests)
+                if result_message.structured_output is not None:
+                    data = result_message.structured_output
+                elif result_message.result:
+                    # Fallback: try to parse result as JSON
+                    # Strip markdown code fences if present (Claude sometimes wraps JSON in ```)
+                    try:
+                        stripped_result = strip_markdown_fences(result_message.result)
+                        data = json.loads(stripped_result)
+                    except json.JSONDecodeError:
+                        # Model returned text instead of structured JSON
+                        result_text = result_message.result
+                        preview = result_text[:500] + "..." if len(result_text) > 500 else result_text
+
+                        if _is_clarification_request(result_text):
+                            session_info = f" (session_id: {session_id_result})" if session_id_result else ""
+                            raise RuntimeError(
+                                f"Claude requested clarification instead of producing structured output{session_info}.\n\n"
+                                f"This typically happens when the issue/prompt lacks sufficient detail.\n"
+                                f"Consider providing more context in the issue description.\n\n"
+                                f"Claude's questions:\n{preview}"
+                            ) from None
+                        else:
+                            raise RuntimeError(
+                                f"Claude SDK returned text instead of structured JSON.\n"
+                                f"Expected: JSON matching the requested schema\n"
+                                f"Received: {preview}"
+                            ) from None
+                else:
+                    raise RuntimeError("Claude SDK returned no output for schema request")
+
+                # Workaround: Some Claude CLI versions return unwrapped lists when the schema
+                # expects {"tasks": [...]}, causing validation to fail. This wraps raw lists
+                # when the schema has a "tasks" field at the root level.
+                # Required for: claude-cli-sdk <= 0.2.x (may be fixed in future versions)
+                if isinstance(data, list) and "tasks" in schema.model_fields:
+                    data = {"tasks": data}
+
+                try:
+                    return (schema.model_validate(data), session_id_result)
+                except ValidationError as e:
+                    raise SchemaValidationError(
+                        f"Claude SDK output did not match schema: {e}",
+                        provider_name="claude",
+                        original_message=str(e),
+                    ) from e
+            else:
+                # Return raw text result
+                if result_message.result:
+                    return (result_message.result, session_id_result)
+                elif assistant_content:
+                    return ("\n".join(assistant_content), session_id_result)
+                else:
+                    return ("", session_id_result)
+
+        except ProcessError as e:
+            exit_code = getattr(e, "exit_code", None)
+            captured_stderr = "\n".join(stderr_lines) if stderr_lines else ""
+            safe_stderr = _sanitize_stderr(captured_stderr)
+            logger.warning(
+                "Claude CLI process failed, will retry as transient error",
+                exit_code=exit_code,
+                stderr=safe_stderr,
+                error=str(e),
+            )
+            detail = safe_stderr or str(e)
+            raise ModelProviderError(
+                f"Claude CLI process error (exit code {exit_code}): {detail}",
+                provider_name="claude-cli",
+                original_message=str(e),
+            ) from e
+        except Exception as e:
+            if isinstance(e, (RuntimeError, SchemaValidationError)):
+                raise
+            # The SDK raises bare Exception for CLI process failures (e.g.
+            # "Command failed with exit code 1").  Surface captured stderr so
+            # the operator can diagnose the root cause instead of seeing only
+            # "Check stderr output for details".
+            captured_stderr = "\n".join(stderr_lines) if stderr_lines else ""
+            safe_stderr = _sanitize_stderr(captured_stderr)
+            if safe_stderr:
+                raise ModelProviderError(
+                    f"Claude CLI error: {e}\nCaptured stderr:\n{safe_stderr}",
+                    provider_name="claude-cli",
+                    original_message=str(e),
+                ) from e
+            raise RuntimeError(f"Error executing Claude SDK: {e}") from e
+
+    async def execute_agentic(
+        self,
+        prompt: str,
+        cwd: str,
+        session_id: str | None = None,
+        instructions: str | None = None,
+        schema: type[BaseModel] | None = None,
+        allowed_tools: list[str] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[AgenticMessage]:
+        """Execute prompt with full autonomous tool access using ClaudeSDKClient.
+
+        Uses the claude-agent-sdk ClaudeSDKClient for agentic execution, which
+        provides interrupt support, hooks, and session continuity.
+
+        Args:
+            prompt: The user prompt to execute.
+            cwd: Working directory for Claude Code context.
+            session_id: Optional session ID to resume.
+            instructions: Runtime instructions for the agent. Passed via system_prompt.
+            schema: Optional Pydantic model for structured output. When provided,
+                the agent's final response will be constrained to match this schema.
+            allowed_tools: Optional list of canonical tool names to allow.
+                When set, only these tools will be available to the agent.
+
+        Yields:
+            AgenticMessage for each event (thinking, tool_call, tool_result, result).
+        """
+        # Build MCP servers from submit_tools definitions (driver-agnostic portable API).
+        # Each SubmitToolDef becomes an in-process MCP tool whose on_call() is invoked
+        # when Claude calls the tool, capturing structured output via closure.
+        submit_tools: list[SubmitToolDef] | None = kwargs.get("submit_tools")
+        mcp_servers: dict[str, Any] | None = kwargs.get("mcp_servers")
+        effective_allowed_tools = allowed_tools
+
+        if submit_tools:
+            sdk_tools = []
+            for tool_def in submit_tools:
+                # Capture tool_def in closure so each tool keeps its own on_call
+                def _make_handler(td: SubmitToolDef) -> Any:
+                    @sdk_tool(td.name, td.description, td.schema.model_json_schema())
+                    async def _handler(args: Any) -> dict[str, Any]:
+                        try:
+                            await td.on_call(args)
+                        except Exception as exc:
+                            return {
+                                "content": [{"type": "text", "text": f"Error: {exc}"}],
+                                "is_error": True,
+                            }
+                        return {"content": [{"type": "text", "text": "Submitted successfully."}]}
+                    return _handler
+
+                sdk_tools.append(_make_handler(tool_def))
+
+            submit_mcp = create_sdk_mcp_server("amelia-submit", tools=sdk_tools)
+            mcp_servers = {**(mcp_servers or {}), "amelia-submit": submit_mcp}
+            # Keep normal workspace tools available and add the submit tools.
+            if allowed_tools is None:
+                effective_allowed_tools = None
+            else:
+                effective_allowed_tools = [*allowed_tools, *(td.name for td in submit_tools)]
+
+        options = self._build_options(
+            cwd=cwd,
+            session_id=session_id,
+            system_prompt=instructions,
+            schema=schema,
+            bypass_permissions=True,  # Agentic execution always bypasses permissions
+            allowed_tools=effective_allowed_tools,
+            mcp_servers=mcp_servers,
+        )
+
+        # Capture stderr lines from the CLI subprocess for diagnostics.
+        # The SDK hardcodes a placeholder in ProcessError.stderr, so we
+        # collect the real output via the stderr callback.
+        stderr_lines: list[str] = []
+        options.stderr = lambda line: stderr_lines.append(line)
+
+        logger.info("Starting agentic execution", cwd=cwd)
+
+        last_tool_name: str | None = None  # Track for tool_result messages
+
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(prompt)
+                # Use _safe_receive_response to skip unparseable messages
+                # (e.g. rate_limit_event) without killing the stream.
+                # See docstring for why client.receive_response() doesn't work.
+                async for message in _safe_receive_response(client):
+                    _log_sdk_message(message)
+
+                    # Skip SDK StreamEvent objects - they are progress updates
+                    # that don't need to be passed to the developer agent
+                    if isinstance(message, SDKStreamEvent):
+                        continue
+
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                yield AgenticMessage(
+                                    type=AgenticMessageType.THINKING,
+                                    content=block.text,
+                                    model=self.model,
+                                )
+                            elif isinstance(block, ToolUseBlock):
+                                # Track tool calls in history
+                                self.tool_call_history.append(block)
+                                last_tool_name = block.name
+                                # Normalize tool name to standard format
+                                normalized_name = normalize_tool_name(block.name)
+                                yield AgenticMessage(
+                                    type=AgenticMessageType.TOOL_CALL,
+                                    tool_name=normalized_name,
+                                    tool_input=block.input,
+                                    tool_call_id=block.id,
+                                    model=self.model,
+                                )
+                            elif isinstance(block, ToolResultBlock):
+                                content = block.content if isinstance(block.content, str) else str(block.content)
+                                # Normalize tool name to standard format
+                                result_tool_name: str | None = None
+                                if last_tool_name:
+                                    result_tool_name = normalize_tool_name(last_tool_name)
+                                yield AgenticMessage(
+                                    type=AgenticMessageType.TOOL_RESULT,
+                                    tool_name=result_tool_name,
+                                    tool_call_id=block.tool_use_id,
+                                    tool_output=content,
+                                    is_error=block.is_error or False,
+                                    model=self.model,
+                                )
+
+                    elif isinstance(message, UserMessage):
+                        # SDK delivers ToolResultBlock inside UserMessage
+                        if isinstance(message.content, list):
+                            for block in message.content:
+                                if isinstance(block, ToolResultBlock):
+                                    content = block.content if isinstance(block.content, str) else str(block.content)
+                                    # Normalize tool name to standard format
+                                    result_tool_name = None
+                                    if last_tool_name:
+                                        result_tool_name = normalize_tool_name(last_tool_name)
+                                    yield AgenticMessage(
+                                        type=AgenticMessageType.TOOL_RESULT,
+                                        tool_name=result_tool_name,
+                                        tool_call_id=block.tool_use_id,
+                                        tool_output=content,
+                                        is_error=block.is_error or False,
+                                        model=self.model,
+                                    )
+
+                    elif isinstance(message, ResultMessage):
+                        # Store ResultMessage for token usage extraction
+                        self.last_result_message = message
+                        if not message.result:
+                            logger.debug(
+                                "Claude CLI ResultMessage has empty content",
+                                session_id=message.session_id,
+                                is_error=message.is_error,
+                                stderr_lines_count=len(stderr_lines),
+                                stderr_tail=stderr_lines[-5:] if stderr_lines else [],
+                            )
+                        yield AgenticMessage(
+                            type=AgenticMessageType.RESULT,
+                            content=message.result,
+                            session_id=message.session_id,
+                            is_error=message.is_error,
+                            model=self.model,
+                        )
+
+        except ProcessError as e:
+            exit_code = getattr(e, "exit_code", None)
+            # Use captured stderr lines (real output) over SDK placeholder
+            captured_stderr = "\n".join(stderr_lines) if stderr_lines else ""
+            safe_stderr = _sanitize_stderr(captured_stderr)
+            logger.warning(
+                "Claude CLI process failed, will retry as transient error",
+                exit_code=exit_code,
+                stderr=safe_stderr,
+                error=str(e),
+            )
+            detail = safe_stderr or str(e)
+            raise ModelProviderError(
+                f"Claude CLI process error (exit code {exit_code}): {detail}",
+                provider_name="claude-cli",
+                original_message=str(e),
+            ) from e
+        except Exception as e:
+            captured_stderr = "\n".join(stderr_lines) if stderr_lines else ""
+            safe_stderr = _sanitize_stderr(captured_stderr)
+            logger.exception(
+                "Error in agentic execution",
+                stderr=safe_stderr or "(empty)",
+            )
+            if safe_stderr and not isinstance(e, (RuntimeError, SchemaValidationError)):
+                raise ModelProviderError(
+                    f"Claude CLI error: {e}\nCaptured stderr:\n{safe_stderr}",
+                    provider_name="claude-cli",
+                    original_message=str(e),
+                ) from e
+            raise
+
+    def clear_tool_history(self) -> None:
+        self.tool_call_history = []
+
+    def get_usage(self) -> DriverUsage | None:
+        """Return usage from last execution.
+
+        Translates SDK ResultMessage fields to the driver-agnostic DriverUsage model.
+
+        Returns:
+            DriverUsage with accumulated usage data, or None if no execution occurred
+            or no usage data is available.
+        """
+        if self.last_result_message is None:
+            return None
+
+        usage_data = getattr(self.last_result_message, "usage", None)
+        if usage_data is None:
+            return None
+
+        return DriverUsage(
+            input_tokens=usage_data.get("input_tokens"),
+            output_tokens=usage_data.get("output_tokens"),
+            cache_read_tokens=usage_data.get("cache_read_input_tokens"),
+            cache_creation_tokens=usage_data.get("cache_creation_input_tokens"),
+            cost_usd=getattr(self.last_result_message, "total_cost_usd", None),
+            duration_ms=getattr(self.last_result_message, "duration_ms", None),
+            num_turns=getattr(self.last_result_message, "num_turns", None),
+            model=usage_data.get("model") or self.model,
+        )
+
+    async def cleanup_session(self, session_id: str) -> bool:
+        """Clean up session state.
+
+        ClaudeCliDriver delegates session management to the SDK,
+        so no explicit cleanup is needed.
+
+        Args:
+            session_id: The driver session ID (unused).
+
+        Returns:
+            False - no local state to clean up.
+        """
+        return False
